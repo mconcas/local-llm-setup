@@ -1,0 +1,55 @@
+services:
+  # ── llama.cpp server (CUDA) ──────────────────────────────────────
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: llama-server
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    environment:
+      # These are passed as CLI args by the entrypoint
+      LLAMA_ARG_MODEL: ${MODEL_FILE:-/models/model.gguf}
+      LLAMA_ARG_CTX_SIZE: ${CTX_SIZE:-4096}
+      LLAMA_ARG_N_GPU_LAYERS: ${GPU_LAYERS:--1}
+      LLAMA_ARG_PARALLEL: ${PARALLEL:-4}
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8080"
+    # Expose the raw HTTP port only on localhost (not to the network).
+    # For network access, use the nginx HTTPS proxy below.
+    ports:
+      - "127.0.0.1:8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks:
+      - llm-net
+
+  # ── nginx TLS reverse proxy ─────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: llama-proxy
+    restart: unless-stopped
+    depends_on:
+      llama-server:
+        condition: service_healthy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    ports:
+      - "${HTTPS_PORT:-8443}:443"
+    networks:
+      - llm-net
+
+networks:
+  llm-net:
+    driver: bridge

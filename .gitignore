@@ -1,0 +1,11 @@
+# Models (large files)
+models/*.gguf
+
+# TLS certificates (sensitive)
+certs/
+
+# Environment
+.env
+
+# Docker
+docker-compose.override.yml
