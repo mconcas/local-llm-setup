@@ -113,6 +113,28 @@ If the client doesn't support custom CA certs, either:
 - Set `NODE_EXTRA_CA_CERTS=path/to/ca.crt` (Node.js clients), or
 - Set `REQUESTS_CA_BUNDLE=path/to/ca.crt` (Python `requests`)
 
+### Using as the backend for an agent framework
+
+This stack is suitable as the LLM backend for agent projects (MCP, LangChain,
+LlamaIndex, OpenAI SDK, custom tool-calling loops) — any client that accepts a
+custom `base_url` + (dummy) API key can point at the HTTPS endpoint above.
+
+Things to keep in mind when wiring it into an agent system:
+
+- **Pick a model trained for tool/function calling.** Generic chat models often
+  fail multi-step agent loops. Good local choices: Qwen2.5-Instruct,
+  Llama-3.1-Instruct, Hermes, Mistral-Nemo-Instruct. llama.cpp's
+  function-calling fidelity also depends on the model's chat template being
+  applied correctly — sanity-check with a tool-calling probe before relying on
+  it.
+- **Respect VRAM limits.** For a 32 GB GPU, Q4_K_M quantisations up to ~32B fit
+  with full GPU offload; 70B-class models will spill to CPU and be slow.
+- **`PARALLEL` caps agent fan-out.** If your agent dispatches many concurrent
+  tool calls or sub-agents, raise `PARALLEL` in `.env` accordingly (each slot
+  consumes additional KV-cache memory).
+- **Local models trail frontier APIs** on long-horizon planning and complex
+  tool use — temper expectations for elaborate agent loops.
+
 ## TLS Certificates
 
 The setup script generates a self-signed CA and server certificate in `./certs/`:

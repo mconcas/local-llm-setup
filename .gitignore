@@ -9,3 +9,6 @@ certs/
 
 # Docker
 docker-compose.override.yml
+
+# Python virtualenv
+.venv/

@@ -45,8 +45,22 @@ MODEL_DIR="$PROJECT_DIR/models"
 
 mkdir -p "$MODEL_DIR"
 
-# ── Check for huggingface-cli ──────────────────────────────────
-has_hf_cli() { command -v huggingface-cli &>/dev/null; }
+# ── Resolve Hugging Face CLI (prefer project venv) ─────────────
+# huggingface-hub >= 0.34 renamed `huggingface-cli` to `hf`. Try the new name
+# first, fall back to the legacy one for older installs.
+HF_CLI=""
+for candidate in \
+    "$PROJECT_DIR/.venv/bin/hf" \
+    "$PROJECT_DIR/.venv/bin/huggingface-cli" \
+    "$(command -v hf 2>/dev/null || true)" \
+    "$(command -v huggingface-cli 2>/dev/null || true)"; do
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    HF_CLI="$candidate"
+    break
+  fi
+done
+
+has_hf_cli() { [[ -n "$HF_CLI" ]]; }
 
 # ── Split/sharded download via --include ───────────────────────
 if [[ "$1" == "--include" ]]; then
@@ -62,7 +76,7 @@ if [[ "$1" == "--include" ]]; then
   echo "    Destination: $MODEL_DIR/"
   echo ""
 
-  huggingface-cli download "$REPO" \
+  "$HF_CLI" download "$REPO" \
     --include "$PATTERN" \
     --local-dir "$MODEL_DIR"
 
@@ -92,7 +106,7 @@ FILE="$1"
 if has_hf_cli; then
   # Prefer huggingface-cli for resume support and authentication
   echo "==> Downloading $FILE from $REPO via huggingface-cli …"
-  huggingface-cli download "$REPO" "$FILE" --local-dir "$MODEL_DIR"
+  "$HF_CLI" download "$REPO" "$FILE" --local-dir "$MODEL_DIR"
 else
   # Fallback to curl
   URL="https://huggingface.co/${REPO}/resolve/main/${FILE}"

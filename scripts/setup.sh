@@ -37,18 +37,35 @@ else
   echo "==> TLS certs already exist in certs/, skipping."
 fi
 
-# ── 4. Check for NVIDIA Container Toolkit ─────────────────────
+# ── 4. Bootstrap Python venv with huggingface-hub ────────────
+echo ""
+VENV_DIR="$PROJECT_DIR/.venv"
+# huggingface-hub >= 0.34 ships the `hf` binary; older versions ship `huggingface-cli`.
+if [[ ! -x "$VENV_DIR/bin/hf" && ! -x "$VENV_DIR/bin/huggingface-cli" ]]; then
+  echo "==> Setting up Python venv for the Hugging Face CLI …"
+  if ! command -v python3 &>/dev/null; then
+    echo "⚠  python3 not found — skipping venv setup."
+    echo "   Install Python 3 and re-run setup.sh to enable model downloads."
+  else
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
+    "$VENV_DIR/bin/pip" install --quiet -U huggingface-hub
+    echo "    Hugging Face CLI installed in .venv/"
+  fi
+else
+  echo "==> Hugging Face CLI already in .venv/, skipping."
+fi
+
+# ── 5. Check for NVIDIA Container Toolkit ─────────────────────
 echo ""
 if command -v nvidia-smi &>/dev/null; then
   echo "==> NVIDIA GPU detected:"
   nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
 else
   echo "⚠  nvidia-smi not found. GPU acceleration may not work."
-  echo "   Install the NVIDIA Container Toolkit:"
-  echo "   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
 fi
 
-# ── 5. Check Docker ───────────────────────────────────────────
+# ── 6. Check Docker ───────────────────────────────────────────
 echo ""
 if command -v docker &>/dev/null; then
   echo "==> Docker version: $(docker --version)"
@@ -61,7 +78,7 @@ else
   echo "⚠  Docker not found. Install Docker Engine first."
 fi
 
-# ── 6. Check for model ────────────────────────────────────────
+# ── 7. Check for model ────────────────────────────────────────
 echo ""
 source .env 2>/dev/null || true
 MODEL_BASENAME="$(basename "${MODEL_FILE:-model.gguf}")"
