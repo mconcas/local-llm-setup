@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./models:/models:ro
+      - ./templates:/templates:ro
     environment:
       # These are passed as CLI args by the entrypoint
       LLAMA_ARG_MODEL: ${MODEL_FILE:-/models/model.gguf}
@@ -14,6 +15,12 @@ services:
       LLAMA_ARG_PARALLEL: ${PARALLEL:-4}
       LLAMA_ARG_HOST: "0.0.0.0"
       LLAMA_ARG_PORT: "8080"
+      # Use the chat template embedded in the GGUF so OpenAI-style tool calls
+      # are parsed into structured `tool_calls` blocks (required for agentic clients).
+      LLAMA_ARG_JINJA: "1"
+      # To override the GGUF-embedded chat template, create docker-compose.override.yml
+      # with:  services: { llama-server: { environment: { LLAMA_ARG_CHAT_TEMPLATE_FILE: /templates/your.jinja } } }
+      # (templates/ is mounted read-only at /templates inside the container)
     # Expose the raw HTTP port only on localhost (not to the network).
     # For network access, use the nginx HTTPS proxy below.
     ports:
