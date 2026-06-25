@@ -15,6 +15,9 @@ services:
       LLAMA_ARG_PARALLEL: ${PARALLEL:-4}
       LLAMA_ARG_HOST: "0.0.0.0"
       LLAMA_ARG_PORT: "8080"
+      # Quantize the KV cache to fit a larger context window in VRAM.
+      LLAMA_ARG_CACHE_TYPE_K: ${CACHE_TYPE_K:-f16}
+      LLAMA_ARG_CACHE_TYPE_V: ${CACHE_TYPE_V:-f16}
       # Use the chat template embedded in the GGUF so OpenAI-style tool calls
       # are parsed into structured `tool_calls` blocks (required for agentic clients).
       LLAMA_ARG_JINJA: "1"
