@@ -608,6 +608,18 @@ rm -f "$P/certs/ca.crt" "$P/certs/server.crt"
 run_jetson "$P" --preflight
 assert_fail "$OUT" "TLS certificates missing" "missing certificates are caught"
 
+# All four files present and the set still unusable - the state a check on
+# presence alone reports as healthy, and nginx reports by refusing to start.
+new_project; healthy_env "$P"
+openssl genrsa -out "$P/certs/server.key" 2048 2>/dev/null
+run_jetson "$P" --preflight
+assert_fail "$OUT" "TLS certificates are inconsistent" "a mismatched key/certificate pair is caught"
+assert_contains "$OUT" "does not match server.key" "the report names the mismatch"
+
+new_project; healthy_env "$P"
+run_jetson "$P" --preflight
+assert_pass "$OUT" "TLS certificates present and consistent" "a good certificate set passes"
+
 # A PATH without docker/curl/python3. Only the check under test is asserted on -
 # removing a tool legitimately disturbs others.
 new_project; healthy_env "$P"

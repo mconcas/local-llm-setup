@@ -346,11 +346,29 @@ preflight() {
 
   head "Preflight - TLS"
 
+  # Presence is a proxy for validity, and the states that matter here have all
+  # four files on disk: a server key that does not match its certificate (nginx
+  # refuses to start), a certificate signed by a CA that has since been
+  # replaced (every client rejects it), an expired CA. gen-certs.sh --check
+  # resolves those; it writes nothing.
   if [[ -f "$CA_CERT" && -f "$PROJECT_DIR/certs/server.crt" ]]; then
-    ok "TLS certificates present"
+    local certchk
+    if certchk="$(CERT_DIR="$PROJECT_DIR/certs" bash "$SCRIPT_DIR/gen-certs.sh" --check 2>&1)"; then
+      ok "TLS certificates present and consistent"
+    else
+      no "TLS certificates are inconsistent: $(grep -m1 '^  [a-z]' <<<"$certchk" | sed 's/^ *//')" \
+         "run: ./scripts/gen-certs.sh --check   for the full report"
+    fi
   else
     no "TLS certificates missing" "run: ./scripts/setup.sh <hostname-or-ip>"
   fi
+
+  # gen-certs.sh writes the only files in this repo that another process holds
+  # open: nginx bind-mounts them. Its failure modes therefore land on a running
+  # proxy rather than in this script's output, and none of them are reachable
+  # from a host whose certificates are already fine. The self-test drives the
+  # real script through each of them and finishes with a TLS handshake.
+  selftest test-gen-certs.sh "certificate generation"
 
   head "Preflight - benchmark"
 

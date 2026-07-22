@@ -165,7 +165,16 @@ if [[ ! -f certs/server.crt ]]; then
   echo ""
   bash "$SCRIPT_DIR/gen-certs.sh" "$@"
 else
-  echo "==> TLS certs already exist in certs/, skipping."
+  # "The file is there" was the whole test, and it is the one state that says
+  # nothing: an interrupted or half-repaired certs/ still has all four files,
+  # and nginx is what discovers the mismatch, by refusing to start.
+  if CERTCHK="$(bash "$SCRIPT_DIR/gen-certs.sh" --check 2>&1)"; then
+    echo "==> TLS certs already exist in certs/ and are consistent."
+  else
+    mismatch "The certificates in certs/ are not usable as they stand." \
+             "$(grep '^  [a-z]' <<<"$CERTCHK" | sed 's/^  /  /')" \
+             "Regenerate:  ./scripts/gen-certs.sh${*:+ $*}"
+  fi
 fi
 
 # ── 5. Bootstrap Python venv with huggingface-hub ────────────

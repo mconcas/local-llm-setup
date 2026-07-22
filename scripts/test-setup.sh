@@ -158,11 +158,18 @@ new_project() {
   cp "$PROJECT_DIR"/docker-compose*.yml "$P/"
   cp "$SCRIPT_DIR"/*.sh "$P/scripts/"
   cp -r "$SCRIPT_DIR/lib" "$P/scripts/"
-  # Pre-seed certs: gen-certs.sh runs openssl, which is neither what these
-  # tests are about nor fast enough to repeat ~20 times.
+  # Pre-seed certs from one real set generated below: setup.sh now verifies
+  # them rather than only looking for the files, and generating a 4096-bit CA
+  # per fixture would cost more than the rest of this suite put together.
   mkdir -p "$P/certs"
-  : >"$P/certs/server.crt"; : >"$P/certs/server.key"; : >"$P/certs/ca.crt"
+  cp "$SEED_CERTS"/ca.crt "$SEED_CERTS"/ca.key \
+     "$SEED_CERTS"/server.crt "$SEED_CERTS"/server.key "$P/certs/"
 }
+
+# One real certificate set, shared by every fixture.
+SEED_CERTS="$TMPROOT/seed-certs"; mkdir -p "$SEED_CERTS"
+CERT_DIR="$SEED_CERTS" bash "$SCRIPT_DIR/gen-certs.sh" --no-auto-ip >/dev/null 2>&1 \
+  || { echo "could not generate the seed certificates" >&2; exit 1; }
 
 # Run setup.sh in a project fixture. OUT/RC are set for the assertions.
 OUT=""; RC=0
@@ -495,6 +502,24 @@ assert_exit "$RC" 0 "exits 0"
 assert_contains "$OUT" "jetson" "still detected as a Jetson"
 assert_eq "$(envval "$P" LLAMA_IMAGE)" "ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin" \
   "still selects the Jetson image"
+
+# ══════════════════════════════════════════════════════════════════
+case_start "Certificates that are present but unusable are reported"
+# ══════════════════════════════════════════════════════════════════
+# setup.sh used to accept certs/ on the strength of server.crt existing, which
+# is true of every broken state as well: nginx is then what discovers that the
+# key does not match, by refusing to start after `docker compose up`.
+new_project
+openssl genrsa -out "$P/certs/server.key" 2048 2>/dev/null
+run_setup "$P" "$JETSON_SYSROOT"
+assert_contains "$OUT" "not usable as they stand" "reports the broken pair"
+assert_contains "$OUT" "does not match server.key" "names what is wrong"
+assert_contains "$OUT" "item(s) to resolve" "counts it as outstanding"
+assert_not_contains "$OUT" "Setup complete" "does not report success"
+
+new_project
+run_setup "$P" "$JETSON_SYSROOT"
+assert_contains "$OUT" "exist in certs/ and are consistent" "a good set is confirmed, not just counted"
 
 # ── Summary ───────────────────────────────────────────────────────
 printf '\n%s────────────────────────────────────────%s\n' "$C_HD" "$C_Z"

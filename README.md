@@ -80,6 +80,7 @@ docker compose up -d
 ./scripts/test-benchmark.sh                   # benchmark self-test
 ./scripts/test-setup.sh                       # bootstrap self-test
 ./scripts/test-download-model.sh              # model acquisition self-test
+./scripts/test-gen-certs.sh                   # certificate self-test
 ./scripts/test-validate.sh                    # the validation suite's own self-test
 ./scripts/test-detect-platform.sh -v          # ... printing every assertion
 ```
@@ -87,7 +88,7 @@ docker compose up -d
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
 merge, model sizing, disk hygiene, container health, full GPU layer offload, the
 OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
-rejects clients which do not trust the CA). It is **41 checks, all green** on a
+rejects clients which do not trust the CA). It is **42 checks, all green** on a
 Jetson Orin Nano Super with the stack up.
 
 Every self-test above also runs as a preflight check, so `./scripts/validate.sh`
@@ -243,7 +244,7 @@ verified the same way. `validate.sh` runs it as part of preflight.
 
 ### The validation suite's own self-test
 
-"41/41 green" is only worth something if a red condition actually turns a check
+"42/42 green" is only worth something if a red condition actually turns a check
 red. On healthy hardware every check reports PASS - which is also exactly what a
 check that *cannot* fail reports, and two of them could not: the "rejects
 clients that do not trust the CA" check passed against an nginx that was down
@@ -373,6 +374,12 @@ curl --cacert certs/ca.crt https://localhost:8443/v1/chat/completions \
 
 ### Connecting from another machine on the network
 
+The certificate has to cover the name or address the client uses. That is the
+default for this host's own addresses; anything else (a DNS alias, a VPN
+address) is added with `./scripts/gen-certs.sh <name-or-ip>` followed by
+`docker compose restart nginx`. `./scripts/gen-certs.sh --check` prints the
+names currently covered.
+
 ```bash
 # On the client, use the server's IP/hostname and trust the CA cert:
 curl --cacert ca.crt https://10.0.0.5:8443/v1/models
@@ -434,12 +441,66 @@ The setup script generates a self-signed CA and server certificate in `./certs/`
 | `server.crt` | Server certificate (used by nginx)             |
 | `server.key` | Server private key (used by nginx)             |
 
-To regenerate certs (e.g., with new SANs):
+`setup.sh` calls `gen-certs.sh`, which also runs standalone:
 
 ```bash
-rm -rf certs/
-./scripts/gen-certs.sh myserver.lan 10.0.0.5 192.168.1.100
+./scripts/gen-certs.sh                      # localhost, the hostname, this host's addresses
+./scripts/gen-certs.sh myserver.lan 10.0.0.5 192.168.1.100   # add names
+./scripts/gen-certs.sh --check              # verify what is installed; writes nothing
+./scripts/gen-certs.sh --force              # replace the CA as well
+./scripts/gen-certs.sh --reset-sans         # forget names added by earlier runs
 ```
+
+Four properties are worth knowing, because each of them was once the opposite:
+
+- **The addresses of this host are covered by default.** A headless Jetson is
+  reached at `https://192.168.x.y:8443`, and a certificate for `localhost`
+  alone fails there with "no alternative certificate subject name matches
+  target host name". Docker's own bridges (`docker0`, `br-*`, `veth*`) are left
+  out. `--no-auto-ip` opts out.
+- **Names already in service are kept.** Re-running to add an address used to
+  reissue from a bare list and silently drop every name an earlier run had
+  added, so whichever client used the dropped name started failing for no
+  visible reason. `--reset-sans` starts over deliberately.
+- **A run that cannot finish changes nothing.** Everything is built in a
+  staging directory and installed only after the key, the certificate and the
+  CA have been checked against each other. Previously a typo in an argument -
+  `192.168.1.400`, a name with a space - overwrote `server.key`, failed to sign
+  with openssl's explanation sent to `/dev/null`, and left a pair that made
+  nginx refuse to start with "key values mismatch".
+- **The CA is reused unless you ask otherwise**, so clients that already trust
+  `ca.crt` keep working when you add a name. `--force` replaces it and says so;
+  every client then has to install the new `ca.crt`. A CA that is expired, does
+  not match its key, or is not a CA at all is reported by name rather than used
+  to sign something no client will accept.
+
+`ca.key` is only needed to issue certificates. Keeping it off the serving host
+is better practice, and `--check` treats it as optional rather than missing.
+
+**nginx reads the certificates once, at startup.** After regenerating, reload
+the proxy or the old certificate stays in service:
+
+```bash
+docker compose restart nginx
+```
+
+### Certificate self-test
+
+`certs/` is the only directory in this repo another process holds open, so the
+interesting failures land on a running proxy rather than in the script's
+output - and none of them are reachable from a host whose certificates are
+already fine. `test-gen-certs.sh` drives the real script through each of them
+against a private `CERT_DIR` with stubbed `hostname` and `ip`: a typo'd
+address, a name with a space, half a CA left by an interrupted run, a CA that
+does not match its key, an expired CA, a `ca.crt` that is not a CA, an openssl
+that fails at the signing step, a host with no address probe, a system hostname
+that is not a valid DNS name.
+
+The assertions end in a real TLS handshake against the generated pair - a
+server that loads exactly what nginx mounts, a client that verifies with
+`ca.crt` - because a certificate that inspects correctly can still be one no
+TLS stack will accept. It needs no GPU, Docker, model or network, and
+`validate.sh` runs it as a preflight check.
 
 ## File Structure
 
@@ -457,7 +518,8 @@ rm -rf certs/
 │   ├── setup.sh                # Bootstrap + .env/platform consistency check
 │   ├── test-setup.sh           # Hermetic tests for the bootstrap
 │   ├── detect-platform.sh      # Hardware detection + tuned defaults
-│   ├── gen-certs.sh            # TLS certificate generator
+│   ├── gen-certs.sh            # TLS certificate generator (staged + verified)
+│   ├── test-gen-certs.sh       # Hermetic tests for certificate generation
 │   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
 │   ├── test-download-model.sh  # Hermetic tests for the downloader
 │   ├── validate.sh             # End-to-end validation suite
