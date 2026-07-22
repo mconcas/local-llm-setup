@@ -22,42 +22,147 @@ Clients (MCP server, curl, etc.)
     ./models/        ← local GGUF model files (bind-mounted)
 ```
 
+## Supported platforms
+
+| Platform                        | Status    | GPU passthrough | Image                                            |
+|---------------------------------|-----------|-----------------|--------------------------------------------------|
+| x86_64 + discrete NVIDIA GPU    | supported | `--gpus` (Compose device reservation) | `ghcr.io/ggml-org/llama.cpp:server-cuda` |
+| NVIDIA Jetson Orin (JetPack 6)  | supported | CDI             | `ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin` |
+
+`./scripts/setup.sh` detects which of the two it is running on and writes
+matching defaults into `.env` — image, GPU mechanism, context size, KV cache
+type and a model recommendation sized to the available memory. Run
+`./scripts/detect-platform.sh` on its own to see what it would pick.
+
 ## Quick Start
 
 ```bash
 # 1. Clone and enter the repo
 git clone <this-repo> && cd local-llm-setup
 
-# 2. Run the setup script (generates TLS certs, checks prerequisites)
-#    Pass extra hostnames/IPs for the TLS certificate SANs:
+# 2. Run the setup script: detects the platform, writes .env, generates TLS
+#    certs. Pass extra hostnames/IPs for the certificate SANs:
 ./scripts/setup.sh myserver.lan 10.0.0.5
 
-# 3. Download a model (or place a .gguf file in ./models/ manually)
+# 3. Download a model. setup.sh prints one sized for this machine; on an
+#    8 GB Jetson Orin Nano that is:
 ./scripts/download-model.sh \
-  TheBloke/Mistral-7B-Instruct-v0.2-GGUF \
-  mistral-7b-instruct-v0.2.Q4_K_M.gguf
+  bartowski/Qwen2.5-3B-Instruct-GGUF \
+  Qwen2.5-3B-Instruct-Q4_K_M.gguf
 
 # 4. Point .env to your model
-sed -i 's|MODEL_FILE=.*|MODEL_FILE=/models/mistral-7b-instruct-v0.2.Q4_K_M.gguf|' .env
+sed -i 's|MODEL_FILE=.*|MODEL_FILE=/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf|' .env
 
 # 5. Start the stack
 docker compose up -d
 
-# 6. Verify
-curl --cacert certs/ca.crt https://localhost:8443/v1/models
+# 6. Validate everything end to end
+./scripts/validate.sh
+```
+
+## Validation and benchmarking
+
+```bash
+./scripts/validate.sh              # preflight + runtime checks, non-zero exit on failure
+./scripts/validate.sh --preflight  # config/hardware only, no running stack needed
+./scripts/validate.sh --runtime    # assume the stack is already up
+
+./scripts/benchmark.sh                        # throughput sweep
+./scripts/benchmark.sh -r 5 -n 256            # 5 reps, 256 generated tokens
+./scripts/benchmark.sh --json results.json    # machine-readable output
+```
+
+`validate.sh` covers platform detection, GPU passthrough wiring, the Compose
+merge, model sizing, container health, full GPU layer offload, the OpenAI
+endpoints, streaming, tool calling, and the TLS proxy (including that it
+rejects clients which do not trust the CA).
+
+`benchmark.sh` drives the deployed HTTP endpoint rather than `llama-bench`, so
+the numbers reflect the stack as a client sees it. It reports prompt-eval
+throughput (compute bound), generation throughput (memory-bandwidth bound) and
+time to first token, with prompt caching disabled so the prompt-eval figure is
+real.
+
+## Running on NVIDIA Jetson
+
+Validated on a **Jetson Orin Nano Super (8 GB), JetPack 6 / L4T R36.4.7**.
+`setup.sh` handles all of the below automatically; this section explains what it
+does and why, since the differences from a discrete-GPU host are not cosmetic.
+
+**GPU passthrough uses CDI, not `--gpus`.** Compose's
+`deploy.resources.reservations.devices` maps onto Docker's legacy `--gpus` path,
+which on Tegra resolves to `nvidia-container-cli` in CSV mode. That bind-mounts
+several hundred driver files into the container and then runs `ldconfig` over
+the merged overlay. On JetPack 6 that step routinely stalls for minutes in
+uninterruptible I/O — the container sits in `Created`, and the Docker daemon
+becomes unresponsive with it. `docker-compose.jetson.yml` clears that
+reservation and requests the GPU through CDI (`nvidia.com/gpu=all`) instead,
+which applies a pre-generated spec with no hook and starts in about a second.
+
+If `/etc/cdi/nvidia.yaml` does not exist, generate it once:
+
+```bash
+sudo nvidia-ctk cdi generate --mode=csv --output=/etc/cdi/nvidia.yaml
+```
+
+**The upstream image does not work on Jetson.**
+`ghcr.io/ggml-org/llama.cpp:server-cuda` publishes an arm64 manifest and it is
+misleading: it starts, enumerates the iGPU and prints `CUDA0: Orin`. It then
+dies at the first kernel launch with
+
+```
+CUDA error: the provided PTX was compiled with an unsupported toolchain
+```
+
+because it carries no `sm_87` cubin and its embedded PTX was produced by a newer
+CUDA toolkit than the L4T driver accepts. Device enumeration is therefore *not*
+evidence that a build works — inference has to be exercised, which is what
+`validate.sh` does. Use `ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin`,
+which is compiled for `sm_87` against the L4T CUDA stack (verify with
+`CUDA : ARCHS = 870` in the server log).
+
+**Memory is unified, so "VRAM" is system RAM.** llama.cpp reports the full
+7619 MiB on an 8 GB board, but the OS, the desktop session and the page cache
+are drawing on the same pool. `detect-platform.sh` budgets total RAM minus a
+2 GB OS reserve. Exceeding it does not degrade gracefully — the container
+crash-loops on a `cudaMalloc failed: out of memory` while allocating the KV
+cache. Keep `PARALLEL=1` and quantise the KV cache with `CACHE_TYPE_K/V=q8_0`,
+which roughly halves KV memory against `f16` for negligible quality cost.
+
+**Model sizing.** On an 8 GB Orin Nano, a 3B model at Q4_K_M (~1.9 GB) leaves
+comfortable room for a 16k context. Measured with `benchmark.sh`:
+
+| Model                        | Power mode | prompt eval | generation |
+|------------------------------|-----------|-------------|------------|
+| Qwen2.5-3B-Instruct Q4_K_M   | 15 W      | ~500 tok/s  | ~14 tok/s  |
+
+Generation is bandwidth bound, so it barely moves with prompt length. The Orin
+Nano *Super* also has a 25 W mode, which is not the default and is worth
+enabling before benchmarking:
+
+```bash
+sudo nvpmodel -m 2 && sudo jetson_clocks   # check `sudo nvpmodel -q` for the mode list
 ```
 
 ## Configuration
 
-All settings live in `.env` (created from `.env.example` by the setup script):
+All settings live in `.env` (created from `.env.example` by the setup script,
+with platform-appropriate values filled in):
 
-| Variable     | Default              | Description                              |
-|-------------|----------------------|------------------------------------------|
-| `MODEL_FILE` | `/models/model.gguf` | Path to model inside the container       |
-| `CTX_SIZE`   | `4096`               | Context window size (tokens)             |
-| `GPU_LAYERS` | `-1`                 | Layers offloaded to GPU (`-1` = all)     |
-| `PARALLEL`   | `4`                  | Concurrent request slots                 |
-| `HTTPS_PORT` | `8443`               | Port exposed for HTTPS                   |
+| Variable       | Default                      | Description                                              |
+|----------------|------------------------------|----------------------------------------------------------|
+| `COMPOSE_FILE` | `docker-compose.yml`         | Compose files to merge; Jetson appends the overlay        |
+| `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda` | Server image (platform specific)              |
+| `MODELS_DIR`   | `./models`                   | Host directory holding the `.gguf` files                  |
+| `MODEL_FILE`   | `/models/model.gguf`         | Path to model inside the container                        |
+| `CTX_SIZE`     | `4096`                       | Context window size (tokens)                              |
+| `GPU_LAYERS`   | `-1`                         | Layers offloaded to GPU (`-1` = all)                      |
+| `PARALLEL`     | `4`                          | Concurrent request slots                                  |
+| `CACHE_TYPE_K` / `CACHE_TYPE_V` | `f16`       | KV cache quantisation (`q8_0` halves KV memory)           |
+| `HTTPS_PORT`   | `8443`                       | Port exposed for HTTPS                                    |
+
+`MODELS_DIR` exists so models can live on a separate data disk without a
+machine-specific symlink in the repository.
 
 ## OpenAI-Compatible API
 
@@ -128,7 +233,9 @@ Things to keep in mind when wiring it into an agent system:
   applied correctly — sanity-check with a tool-calling probe before relying on
   it.
 - **Respect VRAM limits.** For a 32 GB GPU, Q4_K_M quantisations up to ~32B fit
-  with full GPU offload; 70B-class models will spill to CPU and be slow.
+  with full GPU offload; 70B-class models will spill to CPU and be slow. On an
+  8 GB Jetson the ceiling is a 3B-class Q4_K_M, and the budget is shared with
+  the OS rather than being dedicated VRAM — see the Jetson section above.
 - **`PARALLEL` caps agent fan-out.** If your agent dispatches many concurrent
   tool calls or sub-agents, raise `PARALLEL` in `.env` accordingly (each slot
   consumes additional KV-cache memory).
@@ -162,10 +269,14 @@ rm -rf certs/
 ├── .env.example                # Template for .env
 ├── nginx/
 │   └── nginx.conf              # TLS reverse proxy config
+├── docker-compose.jetson.yml   # Jetson overlay (CDI GPU passthrough)
 ├── scripts/
 │   ├── setup.sh                # Bootstrap script
+│   ├── detect-platform.sh      # Hardware detection + tuned defaults
 │   ├── gen-certs.sh            # TLS certificate generator
-│   └── download-model.sh       # Model downloader (Hugging Face)
+│   ├── download-model.sh       # Model downloader (Hugging Face)
+│   ├── validate.sh             # End-to-end validation suite
+│   └── benchmark.sh            # Throughput benchmark
 ├── models/                     # GGUF model files (git-ignored)
 │   └── *.gguf
 └── certs/                      # TLS certificates (git-ignored)
@@ -177,10 +288,32 @@ rm -rf certs/
 
 ## Troubleshooting
 
+Start with `./scripts/validate.sh` — most of the failure modes below are
+detected by name, with the fix in the message.
+
 **Container won't start / GPU not found:**
 - Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - Run `nvidia-smi` to confirm GPU visibility
 - Run `docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi` to test Docker GPU access
+- On Jetson, do **not** use `--gpus all` for this test — it hangs (see below).
+  Use `docker run --rm --device nvidia.com/gpu=all ubuntu:24.04 ls /dev/nvhost-gpu`
+
+**Jetson: container stuck in `Created`, `docker` commands hang:**
+- The legacy `--gpus` path is being used. Confirm `.env` has
+  `COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml`, and that
+  `docker compose config` shows `nvidia.com/gpu=all` and no `driver: nvidia`.
+- A stuck `ldconfig.real` in `D` state (`ps -eo stat,comm | grep D`) is the
+  signature. It clears on its own, but takes minutes.
+
+**Jetson: `CUDA error: the provided PTX was compiled with an unsupported toolchain`:**
+- The image has no `sm_87` kernels. Set
+  `LLAMA_IMAGE=ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin` in `.env`.
+
+**Jetson: `cudaMalloc failed: out of memory` while loading:**
+- Unified memory is exhausted. Lower `CTX_SIZE`, set `PARALLEL=1`, set
+  `CACHE_TYPE_K=q8_0` and `CACHE_TYPE_V=q8_0`, or use a smaller quantisation.
+- Free the page cache first if a large file was just written:
+  `sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'`
 
 **Model loading is slow:**
 - Increase `GPU_LAYERS` (default `-1` = all) to offload more to GPU

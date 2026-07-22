@@ -1,0 +1,42 @@
+# Jetson (Tegra) overlay.
+#
+# Apply on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.jetson.yml up -d
+# or set COMPOSE_FILE in .env (scripts/setup.sh does this automatically):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml
+#
+# Why Jetson needs its own GPU wiring:
+#
+# The base file requests the GPU through `deploy.resources.reservations.devices`,
+# which Docker implements with the legacy `--gpus` code path. On Tegra that
+# resolves to nvidia-container-cli in CSV mode, which bind-mounts several hundred
+# host driver files into the container and then runs ldconfig against the merged
+# overlay. On JetPack 6 that step routinely stalls for minutes in uninterruptible
+# I/O, leaving the container stuck in "Created" and taking the Docker daemon with
+# it. CDI performs the same injection from a pre-generated spec
+# (/etc/cdi/nvidia.yaml) without the hook or the ldconfig pass, and starts in
+# about a second.
+#
+# `!reset` clears the inherited reservation so the two mechanisms do not both
+# apply - requesting the GPU twice reintroduces the hang the CDI path avoids.
+services:
+  llama-server:
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []
+    devices:
+      - nvidia.com/gpu=all
+
+    # The Jetson image is a plain L4T userspace with CMD=/bin/bash, unlike the
+    # upstream image whose ENTRYPOINT is already the server binary. Point it at
+    # the binary so the LLAMA_ARG_* environment from the base file is picked up
+    # the same way on both platforms (llama.cpp reads those itself).
+    entrypoint: ["/usr/local/bin/llama-server"]
+
+    # Loading a multi-GB GGUF off the Jetson's storage into unified memory is
+    # far slower than on a discrete-GPU workstation, and every allocation
+    # competes with the OS for the same RAM. Give the first health check enough
+    # room that a cold start is not reported as a failure.
+    healthcheck:
+      start_period: 300s

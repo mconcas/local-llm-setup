@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# validate.sh - End-to-end validation of the llama.cpp stack.
+#
+# Split into two groups:
+#
+#   preflight  static checks that need no running containers - platform
+#              detection, GPU passthrough wiring, compose merge, model file
+#   runtime    the stack as a client actually sees it - health, OpenAI
+#              endpoints, streaming, tool calling, TLS, GPU offload
+#
+# Usage:
+#   ./scripts/validate.sh              # preflight + runtime
+#   ./scripts/validate.sh --preflight  # static checks only (no stack needed)
+#   ./scripts/validate.sh --runtime    # assume the stack is already up
+#
+# Exit status is non-zero if any check fails, so this is usable in CI.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_DIR"
+
+MODE="all"
+case "${1:-}" in
+  --preflight) MODE="preflight" ;;
+  --runtime)   MODE="runtime" ;;
+  "")          MODE="all" ;;
+  *) echo "Unknown option: $1"; echo "Usage: $0 [--preflight|--runtime]"; exit 2 ;;
+esac
+
+PASS=0; FAIL=0; SKIP=0
+FAILED_NAMES=()
+
+if [[ -t 1 ]]; then
+  C_OK=$'\033[32m'; C_NO=$'\033[31m'; C_SK=$'\033[33m'; C_HD=$'\033[1m'; C_Z=$'\033[0m'
+else
+  C_OK=""; C_NO=""; C_SK=""; C_HD=""; C_Z=""
+fi
+
+ok()   { PASS=$((PASS+1)); printf '  %sPASS%s  %s\n' "$C_OK" "$C_Z" "$1"; }
+no()   { FAIL=$((FAIL+1)); FAILED_NAMES+=("$1"); printf '  %sFAIL%s  %s\n' "$C_NO" "$C_Z" "$1"
+         [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; return 0; }
+skip() { SKIP=$((SKIP+1)); printf '  %sSKIP%s  %s\n' "$C_SK" "$C_Z" "$1"
+         [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; return 0; }
+head() { printf '\n%s%s%s\n' "$C_HD" "$1" "$C_Z"; }
+
+# ── Configuration ─────────────────────────────────────────────────
+[[ -f .env ]] && set -a && . ./.env && set +a
+HTTPS_PORT="${HTTPS_PORT:-8443}"
+CA_CERT="$PROJECT_DIR/certs/ca.crt"
+HTTP_BASE="http://127.0.0.1:8080"
+HTTPS_BASE="https://localhost:${HTTPS_PORT}"
+
+eval "$(bash "$SCRIPT_DIR/detect-platform.sh" --env 2>/dev/null)" || true
+
+# `docker compose` needs the same file list the user runs with. COMPOSE_FILE is
+# exported from .env above, so a bare `docker compose` already picks it up.
+dc() { docker compose "$@"; }
+
+# Extract a field from a JSON document on stdin without requiring jq.
+jget() { python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+for k in sys.argv[1:]:
+    if isinstance(d,list):
+        try: d=d[int(k)]
+        except Exception: sys.exit(1)
+    else:
+        if not isinstance(d,dict) or k not in d: sys.exit(1)
+        d=d[k]
+print(d if not isinstance(d,(dict,list)) else json.dumps(d))
+" "$@"; }
+
+# ══════════════════════════════════════════════════════════════════
+# Preflight
+# ══════════════════════════════════════════════════════════════════
+preflight() {
+  head "Preflight - platform"
+
+  if [[ -n "${PLATFORM_KIND:-}" ]]; then
+    ok "platform detected: $PLATFORM_KIND (${PLATFORM_LABEL:-unknown})"
+  else
+    no "detect-platform.sh did not report a platform"
+  fi
+
+  if [[ -n "${GPU_MEM_MB:-}" ]] && (( GPU_MEM_MB > 0 )); then
+    ok "usable GPU memory budget: $((GPU_MEM_MB)) MiB"
+  else
+    skip "no GPU memory budget (CPU-only host)"
+  fi
+
+  head "Preflight - tooling"
+
+  if command -v docker &>/dev/null; then
+    ok "docker present ($(docker --version | sed 's/,.*//'))"
+  else
+    no "docker not found"
+  fi
+
+  if docker compose version &>/dev/null; then
+    ok "docker compose present (v$(docker compose version --short 2>/dev/null))"
+  else
+    no "docker compose v2 not found"
+  fi
+
+  head "Preflight - GPU passthrough"
+
+  case "${PLATFORM_KIND:-}" in
+    jetson)
+      # The legacy --gpus path hangs on JetPack 6, so the Jetson overlay must be
+      # active and must be the *only* GPU request in the merged config.
+      if [[ "${GPU_ACCESS:-}" == "cdi" ]]; then
+        ok "CDI spec present under /etc/cdi"
+      else
+        no "no CDI spec found" \
+           "run: sudo nvidia-ctk cdi generate --mode=csv --output=/etc/cdi/nvidia.yaml"
+      fi
+
+      if [[ "${COMPOSE_FILE:-docker-compose.yml}" == *docker-compose.jetson.yml* ]]; then
+        ok "COMPOSE_FILE selects the Jetson overlay"
+      else
+        no "COMPOSE_FILE does not include docker-compose.jetson.yml" \
+           "set COMPOSE_FILE=${COMPOSE_FILES:-docker-compose.yml:docker-compose.jetson.yml} in .env"
+      fi
+
+      local cfg
+      cfg="$(dc config 2>/dev/null)"
+      if grep -q 'nvidia.com/gpu=all' <<<"$cfg"; then
+        ok "merged config requests the GPU over CDI"
+      else
+        no "merged config has no CDI device request"
+      fi
+      if grep -q 'driver: nvidia' <<<"$cfg"; then
+        no "merged config still carries the legacy nvidia device reservation" \
+           "this reintroduces the JetPack 6 ldconfig hang"
+      else
+        ok "legacy nvidia device reservation is cleared"
+      fi
+      ;;
+    nvidia-discrete)
+      if dc config 2>/dev/null | grep -q 'driver: nvidia'; then
+        ok "merged config reserves an nvidia device"
+      else
+        no "merged config does not request a GPU"
+      fi
+      ;;
+    *)
+      skip "no NVIDIA GPU detected - nothing to check"
+      ;;
+  esac
+
+  head "Preflight - compose and model"
+
+  if dc config >/dev/null 2>&1; then
+    ok "compose config is valid (${COMPOSE_FILE:-docker-compose.yml})"
+  else
+    no "compose config is invalid" "$(dc config 2>&1 | tail -3)"
+  fi
+
+  # MODEL_FILE is a container path under /models; map it back to the host.
+  local host_model="${MODELS_DIR:-./models}/${MODEL_FILE##/models/}"
+  if [[ -z "${MODEL_FILE:-}" ]]; then
+    no "MODEL_FILE is not set in .env"
+  elif [[ "${MODEL_FILE}" != /models/* ]]; then
+    no "MODEL_FILE must be a container path starting with /models/ (got: $MODEL_FILE)"
+  elif [[ -f "$host_model" ]]; then
+    ok "model file present ($(du -h "$host_model" | cut -f1): $(basename "$host_model"))"
+  else
+    no "model file not found at $host_model" \
+       "download one: ./scripts/download-model.sh ${REC_MODEL_REPO:-<repo>} ${REC_MODEL_FILE:-<file>}"
+  fi
+
+  # A model that does not fit leaves the container in a crash loop with an
+  # opaque cudaMalloc failure, so flag it here where the message can be useful.
+  if [[ -f "$host_model" && -n "${GPU_MEM_MB:-}" ]] && (( GPU_MEM_MB > 0 )); then
+    local model_mb; model_mb=$(( $(stat -c %s "$host_model") / 1048576 ))
+    if (( model_mb < GPU_MEM_MB )); then
+      ok "model weights (${model_mb} MiB) fit the ${GPU_MEM_MB} MiB budget"
+    else
+      no "model weights (${model_mb} MiB) exceed the ${GPU_MEM_MB} MiB budget" \
+         "expect an out-of-memory failure at load; try ${REC_MODEL_FILE:-a smaller quant}"
+    fi
+  fi
+
+  if [[ -f "$CA_CERT" && -f "$PROJECT_DIR/certs/server.crt" ]]; then
+    ok "TLS certificates present"
+  else
+    no "TLS certificates missing" "run: ./scripts/setup.sh <hostname-or-ip>"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Runtime
+# ══════════════════════════════════════════════════════════════════
+runtime() {
+  head "Runtime - containers"
+
+  local ps_out; ps_out="$(dc ps --format '{{.Service}} {{.Status}}' 2>/dev/null)"
+  if grep -q '^llama-server .*Up' <<<"$ps_out"; then
+    ok "llama-server is up"
+  else
+    no "llama-server is not running" "start it: docker compose up -d"
+    echo ""
+    echo "Skipping the remaining runtime checks - the server is required."
+    return
+  fi
+  if grep -qi 'healthy' <<<"$ps_out"; then
+    ok "llama-server reports healthy"
+  else
+    skip "llama-server has no healthy status yet (still starting?)"
+  fi
+
+  head "Runtime - GPU offload"
+
+  local logs; logs="$(dc logs llama-server 2>/dev/null | tail -400)"
+
+  if grep -q 'found 1 CUDA devices\|found [0-9]* CUDA devices' <<<"$logs"; then
+    ok "llama.cpp initialised a CUDA device"
+  else
+    no "llama.cpp did not report a CUDA device" "the model is running on CPU"
+  fi
+
+  # On Jetson the build must contain real sm_87 cubins. Images built for generic
+  # arm64/sbsa enumerate the Orin fine and then die at the first kernel launch
+  # with "the provided PTX was compiled with an unsupported toolchain", so check
+  # the compiled architecture list rather than trusting enumeration.
+  if [[ "${PLATFORM_KIND:-}" == "jetson" ]]; then
+    if grep -qE 'ARCHS = .*870' <<<"$logs"; then
+      ok "image contains sm_87 kernels (Orin)"
+    else
+      no "image does not advertise sm_87 in its CUDA ARCHS" \
+         "use ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin"
+    fi
+    if grep -q 'unsupported toolchain' <<<"$logs"; then
+      no "CUDA PTX JIT failed against the L4T driver" \
+         "the image was built with a CUDA toolkit newer than JetPack supports"
+    else
+      ok "no CUDA PTX toolchain errors in the log"
+    fi
+  fi
+
+  local offl; offl="$(grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' <<<"$logs" | tail -1)"
+  if [[ -n "$offl" ]]; then
+    local n d; n="${offl#offloaded }"; n="${n%%/*}"; d="${offl#*/}"; d="${d%% *}"
+    if [[ "$n" == "$d" ]]; then
+      ok "all layers offloaded to GPU ($n/$d)"
+    else
+      no "only $n of $d layers are on the GPU" "raise GPU_LAYERS or use a smaller model"
+    fi
+  else
+    skip "no layer-offload line found in the log"
+  fi
+
+  head "Runtime - HTTP API"
+
+  if curl -sf --max-time 10 "$HTTP_BASE/health" | grep -q '"status"'; then
+    ok "GET /health"
+  else
+    no "GET /health did not return a status"
+  fi
+
+  local loaded
+  loaded="$(curl -sf --max-time 15 "$HTTP_BASE/v1/models" 2>/dev/null | jget models 0 name 2>/dev/null)"
+  if [[ -n "$loaded" ]]; then
+    ok "GET /v1/models lists '$loaded'"
+  else
+    no "GET /v1/models returned no model"
+  fi
+
+  local slots ctx props
+  props="$(curl -sf --max-time 15 "$HTTP_BASE/props" 2>/dev/null)"
+  slots="$(jget total_slots <<<"$props" 2>/dev/null)"
+  ctx="$(jget default_generation_settings n_ctx <<<"$props" 2>/dev/null)"
+  if [[ -n "$slots" && -n "$ctx" ]]; then
+    ok "GET /props reports $slots slot(s), n_ctx=$ctx"
+    # PARALLEL used to be passed as LLAMA_ARG_PARALLEL, which llama.cpp ignores.
+    # Catch a regression back to that by comparing against the configured value.
+    if [[ -n "${PARALLEL:-}" && "$slots" != "${PARALLEL}" ]]; then
+      no "PARALLEL=${PARALLEL} in .env but the server has $slots slots" \
+         "the server is not receiving LLAMA_ARG_N_PARALLEL"
+    else
+      ok "slot count matches PARALLEL=${PARALLEL:-unset}"
+    fi
+  else
+    no "GET /props did not return slot/context information"
+  fi
+
+  head "Runtime - inference"
+
+  local reply
+  reply="$(curl -sf --max-time 120 "$HTTP_BASE/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"any","temperature":0,"max_tokens":16,
+         "messages":[{"role":"user","content":"Reply with exactly: JETSON OK"}]}' 2>/dev/null \
+    | jget choices 0 message content 2>/dev/null)"
+  if [[ "$reply" == *"JETSON OK"* ]]; then
+    ok "chat completion returns the requested text"
+  elif [[ -n "$reply" ]]; then
+    # A small quantised model may paraphrase; that is still a working pipeline.
+    ok "chat completion produced output (got: $(tr -d '\n' <<<"$reply" | cut -c1-40))"
+  else
+    no "chat completion returned nothing"
+  fi
+
+  local stream
+  stream="$(curl -sf --max-time 120 "$HTTP_BASE/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"any","temperature":0,"max_tokens":32,"stream":true,
+         "messages":[{"role":"user","content":"Count from 1 to 5."}]}' 2>/dev/null)"
+  if grep -q 'data: \[DONE\]' <<<"$stream" && \
+     [[ "$(grep -c '^data: ' <<<"$stream")" -gt 2 ]]; then
+    ok "streaming completion emits SSE chunks and terminates with [DONE]"
+  else
+    no "streaming completion did not produce a well-formed SSE stream"
+  fi
+
+  # Tool calling is the main reason this stack sets LLAMA_ARG_JINJA=1: without
+  # the GGUF chat template the model emits tool calls as prose and agent clients
+  # never see a structured tool_calls block.
+  local tool_json
+  tool_json="$(curl -sf --max-time 120 "$HTTP_BASE/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"any","temperature":0,"max_tokens":128,
+         "messages":[{"role":"user","content":"What is the weather in Turin? Use the tool."}],
+         "tools":[{"type":"function","function":{
+            "name":"get_weather",
+            "description":"Get the current weather for a city",
+            "parameters":{"type":"object",
+              "properties":{"city":{"type":"string","description":"City name"}},
+              "required":["city"]}}}],
+         "tool_choice":"auto"}' 2>/dev/null)"
+  local fn
+  fn="$(jget choices 0 message tool_calls 0 function name <<<"$tool_json" 2>/dev/null)"
+  if [[ "$fn" == "get_weather" ]]; then
+    ok "tool calling returns a structured tool_calls block"
+  else
+    no "tool calling did not produce a structured tool_calls block" \
+       "check that LLAMA_ARG_JINJA=1 and the model ships a tool-aware chat template"
+  fi
+
+  head "Runtime - TLS proxy"
+
+  if [[ ! -f "$CA_CERT" ]]; then
+    skip "no CA certificate at certs/ca.crt"
+  elif ! grep -q '^nginx .*Up' <<<"$ps_out"; then
+    skip "nginx is not running"
+  else
+    if curl -sf --max-time 15 --cacert "$CA_CERT" "$HTTPS_BASE/v1/models" >/dev/null 2>&1; then
+      ok "HTTPS GET /v1/models through nginx"
+    else
+      no "HTTPS request through nginx failed"
+    fi
+
+    # The proxy must not buffer SSE, otherwise streaming clients stall until the
+    # whole completion is done.
+    local https_stream
+    https_stream="$(curl -sf --max-time 120 --cacert "$CA_CERT" "$HTTPS_BASE/v1/chat/completions" \
+      -H 'Content-Type: application/json' \
+      -d '{"model":"any","temperature":0,"max_tokens":24,"stream":true,
+           "messages":[{"role":"user","content":"Say hello."}]}' 2>/dev/null)"
+    if grep -q 'data: \[DONE\]' <<<"$https_stream"; then
+      ok "HTTPS streaming completion works end to end"
+    else
+      no "HTTPS streaming completion failed"
+    fi
+
+    if curl -s --max-time 10 "$HTTPS_BASE/v1/models" 2>&1 | grep -q .; then
+      : # ignore - only checking that an untrusted request is refused below
+    fi
+    if curl -sf --max-time 10 "$HTTPS_BASE/v1/models" >/dev/null 2>&1; then
+      no "HTTPS endpoint accepted a request without the CA - certificate is not being verified"
+    else
+      ok "HTTPS endpoint rejects clients that do not trust the CA"
+    fi
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+printf '%s╔══════════════════════════════════════════════════╗%s\n' "$C_HD" "$C_Z"
+printf '%s║   llama.cpp Local Server - Validation Suite      ║%s\n' "$C_HD" "$C_Z"
+printf '%s╚══════════════════════════════════════════════════╝%s\n' "$C_HD" "$C_Z"
+
+[[ "$MODE" == "all" || "$MODE" == "preflight" ]] && preflight
+[[ "$MODE" == "all" || "$MODE" == "runtime"   ]] && runtime
+
+head "Summary"
+printf '  %s%d passed%s, %s%d failed%s, %s%d skipped%s\n' \
+  "$C_OK" "$PASS" "$C_Z" "$C_NO" "$FAIL" "$C_Z" "$C_SK" "$SKIP" "$C_Z"
+if (( FAIL > 0 )); then
+  printf '\n  Failed checks:\n'
+  printf '    - %s\n' "${FAILED_NAMES[@]}"
+  echo ""
+  exit 1
+fi
+echo ""
+exit 0
