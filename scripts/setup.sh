@@ -21,14 +21,20 @@ echo ""
 # Read one key out of .env. Deliberately not `source`: .env is compose syntax,
 # not shell, so a value containing spaces or a `--flag` aborts sourcing halfway
 # and leaves later keys silently unset. Last uncommented assignment wins, which
-# is what compose itself does.
+# is what compose itself does - as does ending an unquoted value at the first
+# whitespace-preceded '#', and tolerating a file saved with CRLF endings.
 env_get() {
   local key="$1" val
   [[ -f .env ]] || return 0
   val="$(grep -E "^[[:space:]]*${key}=" .env | tail -1)" || return 0
   val="${val#*=}"
-  val="${val%\"}"; val="${val#\"}"
-  val="${val%\'}"; val="${val#\'}"
+  val="${val%$'\r'}"
+  if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
+    val="${val:1:${#val}-2}"
+  else
+    val="${val%%[[:space:]]#*}"
+    val="${val%"${val##*[![:space:]]}"}"
+  fi
   printf '%s' "$val"
 }
 

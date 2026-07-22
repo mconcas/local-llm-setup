@@ -24,10 +24,39 @@
 #   ./scripts/download-model.sh unsloth/Qwen3.5-397B-A17B-GGUF --include 'Q4_K_M/*'
 #
 # Files are saved to MODELS_DIR (from .env), defaulting to ./models.
+#
+# HF_ENDPOINT overrides the Hugging Face base URL (a mirror, an internal proxy).
+# huggingface_hub honours the same variable, so both download paths agree.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+HF_ENDPOINT="${HF_ENDPOINT%/}"
+export HF_ENDPOINT
+
+# Read one key out of .env with compose's semantics: the last uncommented
+# assignment wins, surrounding quotes come off, and an unquoted value ends at
+# the first whitespace-preceded '#'. Deliberately not `source` and deliberately
+# not a bare `sed 's/^KEY=//'`: .env is compose syntax, so both a documented
+# inline comment and a file saved with CRLF line endings otherwise end up
+# *inside* the value, and a path is the one setting where that is invisible
+# until several GB have landed in a directory nothing reads.
+env_get() {
+  local key="$1" val
+  [[ -f "$PROJECT_DIR/.env" ]] || return 0
+  val="$(grep -E "^[[:space:]]*${key}=" "$PROJECT_DIR/.env" | tail -1)" || return 0
+  val="${val#*=}"
+  val="${val%$'\r'}"
+  if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
+    val="${val:1:${#val}-2}"
+  else
+    val="${val%%[[:space:]]#*}"
+    val="${val%"${val##*[![:space:]]}"}"
+  fi
+  printf '%s' "$val"
+}
 
 # ── Destination ────────────────────────────────────────────────
 # docker-compose.yml bind-mounts ${MODELS_DIR:-./models} at /models, and both
@@ -35,11 +64,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # ./models here would silently download into the repo on any host that points
 # MODELS_DIR at a data disk - the container would never see the file, and the
 # several GB would sit on the wrong filesystem unnoticed.
-MODEL_DIR="./models"
-if [[ -f "$PROJECT_DIR/.env" ]]; then
-  _env_models_dir="$(sed -n 's/^[[:space:]]*MODELS_DIR=//p' "$PROJECT_DIR/.env" | tail -1 | tr -d '"'\''')"
-  [[ -n "$_env_models_dir" ]] && MODEL_DIR="$_env_models_dir"
-fi
+MODEL_DIR="$(env_get MODELS_DIR)"
+MODEL_DIR="${MODEL_DIR:-./models}"
 # Resolve relative paths against the project, not the caller's cwd.
 [[ "$MODEL_DIR" != /* ]] && MODEL_DIR="$PROJECT_DIR/${MODEL_DIR#./}"
 
@@ -133,7 +159,10 @@ verify_gguf() {
 # interrupted multi-GB download leaves a blob that nothing will ever use.
 prune_partials() {
   local quiet="${1:-}" found=0 total=0
-  [[ -d "$MODEL_DIR" ]] || return 0
+  if [[ ! -d "$MODEL_DIR" ]]; then
+    [[ "$quiet" != "quiet" ]] && echo "    No partial downloads found."
+    return 0
+  fi
   local f
   while IFS= read -r -d '' f; do
     local sz; sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
@@ -149,7 +178,16 @@ prune_partials() {
 }
 
 # ── Argument handling ──────────────────────────────────────────
-if [[ $# -lt 1 ]]; then usage; exit 1; fi
+# Usage errors exit 2, so a caller can tell "you asked for the wrong thing"
+# apart from "the download failed" (exit 1).
+die_usage() {
+  echo "Error: $1" >&2
+  echo "" >&2
+  usage >&2
+  exit 2
+}
+
+if [[ $# -lt 1 ]]; then usage >&2; exit 2; fi
 
 case "$1" in
   -h|--help) usage; exit 0 ;;
@@ -167,16 +205,41 @@ case "$1" in
     exit 0
     ;;
   --recommended)
-    eval "$(bash "$SCRIPT_DIR/detect-platform.sh" --env)"
+    # Keep stderr out of the string that gets eval'd: any warning the probe
+    # learns to print would otherwise be executed as shell. And check what came
+    # back - a probe that fails on an unfamiliar host used to leave every
+    # REC_* variable unset, so the next line died with a raw bash
+    # "REC_MODEL_REPO: unbound variable" instead of saying what went wrong.
+    _perr="$(mktemp)"
+    trap 'rm -f "$_perr"' EXIT
+    if ! _penv="$(bash "$SCRIPT_DIR/detect-platform.sh" --env 2>"$_perr")"; then
+      echo "Error: platform detection failed - cannot pick a model for this machine." >&2
+      [[ -s "$_perr" ]] && sed 's/^/  /' "$_perr" >&2
+      echo "  Name the repo and file explicitly instead: $0 <hf-repo> <gguf-filename>" >&2
+      exit 1
+    fi
+    eval "$_penv"
+    if [[ -z "${REC_MODEL_REPO:-}" || -z "${REC_MODEL_FILE:-}" ]]; then
+      echo "Error: platform detection returned no model recommendation." >&2
+      [[ -s "$_perr" ]] && sed 's/^/  /' "$_perr" >&2
+      echo "  Run ./scripts/detect-platform.sh to see what it found." >&2
+      echo "  Name the repo and file explicitly instead: $0 <hf-repo> <gguf-filename>" >&2
+      exit 1
+    fi
     REPO="$REC_MODEL_REPO"
     set -- "$REC_MODEL_FILE"
     echo "==> Platform: ${PLATFORM_LABEL:-unknown} (${PLATFORM_KIND:-?})"
-    echo "    Recommended model for a $((GPU_MEM_MB / 1024)) GiB budget:"
+    echo "    Recommended model for a $(( ${GPU_MEM_MB:-0} / 1024 )) GiB budget:"
     echo "      $REPO / $1"
     echo ""
     ;;
+  -*)
+    die_usage "unknown option: $1"
+    ;;
   *)
-    if [[ $# -lt 2 ]]; then usage; exit 1; fi
+    if [[ $# -lt 2 ]]; then
+      die_usage "missing filename - a repo alone does not say which file to fetch."
+    fi
     REPO="$1"
     shift
     ;;
@@ -203,7 +266,10 @@ has_hf_cli() { [[ -n "$HF_CLI" ]]; }
 
 # ── Split/sharded download via --include ───────────────────────
 if [[ "$1" == "--include" ]]; then
-  PATTERN="${2:?Missing pattern after --include}"
+  if [[ $# -lt 2 || -z "$2" ]]; then
+    die_usage "--include requires a pattern, e.g. --include 'Q4_K_M/*'"
+  fi
+  PATTERN="$2"
 
   if ! has_hf_cli; then
     echo "Error: huggingface-cli is required for split/sharded downloads."
@@ -252,26 +318,53 @@ fi
 # ── Single file download ──────────────────────────────────────
 FILE="$1"
 DEST="$MODEL_DIR/$FILE"
-URL="https://huggingface.co/${REPO}/resolve/main/${FILE}"
+URL="$HF_ENDPOINT/${REPO}/resolve/main/${FILE}"
 
-if [[ -f "$DEST" ]] && verify_gguf "$DEST"; then
-  echo "✔ Model already present and valid: $DEST ($(human "$(stat -c %s "$DEST")"))"
-  echo ""
-  echo "Update .env to point to it:"
-  echo "  MODEL_FILE=/models/$FILE"
-  exit 0
-fi
-
-# A file that exists but fails the magic check is a leftover from a previous
-# failed run. Resuming it with `curl -C -` would splice new bytes onto an error
-# page, so start clean instead.
+SIZE=""
 if [[ -f "$DEST" ]]; then
-  echo "==> Discarding invalid existing file ($(human "$(stat -c %s "$DEST")")): $DEST"
-  rm -f "$DEST"
+  EXISTING="$(stat -c %s "$DEST")"
+  if ! verify_gguf "$DEST"; then
+    # A file that fails the magic check is a leftover from a previous failed
+    # run. Resuming it with `curl -C -` would splice new bytes onto an error
+    # page, so start clean instead.
+    echo "==> Discarding invalid existing file ($(human "$EXISTING")): $DEST"
+    rm -f "$DEST"
+  else
+    # Magic bytes alone do not mean the file is complete. A transfer killed
+    # after its first 4 KiB leaves something that starts with "GGUF" and is
+    # still unusable, and this fast path used to accept it forever: every
+    # re-run printed "already present and valid" and exited 0, so the only
+    # way out was to notice the byte count by hand. Confirm the size against
+    # the remote before trusting it.
+    echo "==> Verifying existing $FILE …"
+    SIZE="$(remote_size "$URL" || true)"
+    if [[ -z "$SIZE" ]]; then
+      # Offline, or a repo that has since gone private. The file may well be
+      # fine, so keep it - but do not claim it was verified.
+      echo "⚠  Could not reach $HF_ENDPOINT to confirm the expected size."
+      echo "   Keeping $DEST ($(human "$EXISTING")) unverified."
+      echo ""
+      echo "Update .env to point to it:"
+      echo "  MODEL_FILE=/models/$FILE"
+      exit 0
+    fi
+    if (( EXISTING == SIZE )); then
+      echo "✔ Model already present and verified: $DEST ($(human "$EXISTING"), GGUF, full size)"
+      echo ""
+      echo "Update .env to point to it:"
+      echo "  MODEL_FILE=/models/$FILE"
+      exit 0
+    fi
+    echo "==> Existing file is incomplete: have $(human "$EXISTING"), expected $(human "$SIZE")."
+    echo "    Discarding it and downloading again."
+    rm -f "$DEST"
+  fi
 fi
 
-echo "==> Checking $FILE in $REPO …"
-SIZE="$(remote_size "$URL" || true)"
+if [[ -z "$SIZE" ]]; then
+  echo "==> Checking $FILE in $REPO …"
+  SIZE="$(remote_size "$URL" || true)"
+fi
 if [[ -z "$SIZE" ]]; then
   echo "" >&2
   echo "Error: $FILE was not found in $REPO (or Hugging Face is unreachable)." >&2
@@ -287,8 +380,11 @@ echo "    Dest: $DEST"
 echo ""
 
 # Remove a partial transfer on interrupt or error so a failed run never leaves
-# a truncated GGUF sitting in models/ for setup.sh to pick up.
-cleanup_partial() { [[ -f "$DEST" ]] && ! verify_gguf "$DEST" && rm -f "$DEST"; return 0; }
+# a truncated GGUF sitting in models/ for setup.sh to pick up. Unconditionally:
+# this only runs while a transfer is in flight, and the magic bytes are the
+# first thing to arrive, so a file interrupted at 5% passes verify_gguf and
+# looks exactly like a complete model to everything downstream.
+cleanup_partial() { rm -f "$DEST"; return 0; }
 trap cleanup_partial INT TERM
 
 if has_hf_cli; then

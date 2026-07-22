@@ -360,6 +360,28 @@ run_setup "$P" "$JETSON_SYSROOT"
 assert_eq "$(envval "$P" MODEL_FILE)" "/models/quoted-dir-model.gguf" \
   "keys after an unquoted multi-word value are still read"
 assert_not_contains "$OUT" "command not found" "does not execute .env as shell"
+# An inline comment and CRLF line endings are both legal in a .env and both
+# used to end up inside the value. On a path that means setup.sh creates - and
+# then reports on - a directory whose name nobody would ever type.
+new_project
+run_setup "$P" "$JETSON_SYSROOT"
+DATA3="$TMPROOT/datadisk3/models"; mkdir -p "$DATA3"
+printf 'GGUF\x03\x00\x00\x00' >"$DATA3/inline-comment-model.gguf"
+sed -i "s|^MODELS_DIR=.*|MODELS_DIR=$DATA3 # weights live off the repo|" "$P/.env"
+run_setup "$P" "$JETSON_SYSROOT"
+assert_eq "$(envval "$P" MODEL_FILE)" "/models/inline-comment-model.gguf" \
+  "an inline comment is not part of the path"
+assert_not_contains "$OUT" "weights live off the repo" "does not echo the comment as a directory"
+
+new_project
+run_setup "$P" "$JETSON_SYSROOT"
+DATA4="$TMPROOT/datadisk4/models"; mkdir -p "$DATA4"
+printf 'GGUF\x03\x00\x00\x00' >"$DATA4/crlf-model.gguf"
+sed -i "s|^MODELS_DIR=.*|MODELS_DIR=$DATA4\r|" "$P/.env"
+run_setup "$P" "$JETSON_SYSROOT"
+assert_eq "$(envval "$P" MODEL_FILE)" "/models/crlf-model.gguf" \
+  "a CRLF line ending is not part of the path"
+
 # A commented-out key must not win over the live one below it.
 new_project
 cp "$P/.env.example" "$P/.env"

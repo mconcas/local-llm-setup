@@ -78,6 +78,7 @@ docker compose up -d
 ./scripts/test-detect-platform.sh             # platform detection self-test
 ./scripts/test-benchmark.sh                   # benchmark self-test
 ./scripts/test-setup.sh                       # bootstrap self-test
+./scripts/test-download-model.sh              # model acquisition self-test
 ./scripts/test-detect-platform.sh -v          # ... printing every assertion
 ```
 
@@ -187,9 +188,15 @@ built not to waste it:
   Without this a typo'd filename silently produces a 15-byte file containing
   `Entry not found`, which `setup.sh` then wires into `.env` and which
   crash-loops the container with an opaque load error.
-- **It is idempotent.** An already-present, valid model is left alone rather
-  than re-fetched.
+- **It is idempotent, and re-checks rather than assumes.** An already-present
+  model is left alone once its size has been confirmed against the remote. The
+  magic bytes alone are not enough: a transfer killed after its first few KiB
+  still starts with `GGUF`, and that used to be accepted forever - every re-run
+  printed `already present and valid` and exited 0. When the endpoint is
+  unreachable the file is kept but reported as unverified rather than as good.
 - **It downloads to `MODELS_DIR`**, so pointing that at a data disk works.
+  The value is read with compose's own rules, so an inline comment or a `.env`
+  saved with CRLF endings does not become part of the path.
 
 ```bash
 ./scripts/download-model.sh --recommended   # model sized for this machine
@@ -199,6 +206,26 @@ built not to waste it:
 `--prune` deletes partial transfers (`*.incomplete`, `*.gguf.part`) and lists
 the models on disk. Only the one named by `MODEL_FILE` is ever served, so any
 others are safe to delete; `validate.sh` reports how much they hold.
+
+`HF_ENDPOINT` points both download paths at a Hugging Face mirror or an internal
+proxy; `huggingface_hub` honours the same variable.
+
+### Model acquisition self-test
+
+Everything `download-model.sh` can get wrong leaves *something* on disk that
+looks like a model, and the checks downstream then pass on a file the container
+cannot load. None of it is reachable against the real Hugging Face on a healthy
+machine: it takes a 404, a gated repo, a CDN that answers the size probe and
+refuses the transfer, a body shorter than advertised, or a connection dropped
+mid-transfer.
+
+`test-download-model.sh` drives the real script against a stub Hugging Face
+endpoint (`HF_ENDPOINT`) that produces each of those on demand, in throwaway
+project directories, writing nothing larger than 64 KiB. It also covers the
+free-space refusal, `--prune`, `--recommended` against a synthetic Jetson,
+`MODELS_DIR` in every form a `.env` may legally carry it, the argument errors,
+and the `huggingface-cli` path - which is a separate transfer path that must be
+verified the same way. `validate.sh` runs it as part of preflight.
 
 ## Running on NVIDIA Jetson
 
@@ -393,6 +420,7 @@ rm -rf certs/
 │   ├── detect-platform.sh      # Hardware detection + tuned defaults
 │   ├── gen-certs.sh            # TLS certificate generator
 │   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
+│   ├── test-download-model.sh  # Hermetic tests for the downloader
 │   ├── validate.sh             # End-to-end validation suite
 │   ├── test-detect-platform.sh # Hermetic tests for platform detection
 │   ├── benchmark.sh            # Throughput benchmark

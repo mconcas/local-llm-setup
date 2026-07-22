@@ -334,6 +334,26 @@ preflight() {
     no "setup self-test: ${sfail} assertion(s) failed" \
        "first: ${sfirst:-see output}; run ./scripts/test-setup.sh for the rest"
   fi
+
+  head "Preflight - model acquisition"
+
+  # download-model.sh is the only script here that writes gigabytes, on the
+  # board with the least room for a mistake. Everything it can get wrong leaves
+  # something on disk that looks like a model - a truncated transfer, a login
+  # page, several GB outside the mounted directory - and the checks below then
+  # pass on a file the container cannot load. The self-test drives it against a
+  # stub Hugging Face endpoint that 404s, gates, lies about sizes and drops
+  # connections on demand.
+  local dltest
+  if dltest="$(bash "$SCRIPT_DIR/test-download-model.sh" 2>&1)"; then
+    ok "download self-test ($(grep -oE '[0-9]+ passed' <<<"$dltest" | tail -1))"
+  else
+    local dfail dfirst
+    dfail="$(grep -cE '^ +- ' <<<"$dltest")"
+    dfirst="$(grep -E '^ +- ' <<<"$dltest" | sed -n '1s/^ *- //p')"
+    no "download self-test: ${dfail} assertion(s) failed" \
+       "first: ${dfirst:-see output}; run ./scripts/test-download-model.sh for the rest"
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════════
