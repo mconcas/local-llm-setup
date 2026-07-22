@@ -19,7 +19,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET="$SCRIPT_DIR/benchmark.sh"
+REAL_TARGET="$SCRIPT_DIR/benchmark.sh"
+# Set once the fixture project exists; the real script is run from a copy so the
+# reported configuration comes from a known .env rather than the host's.
+TARGET="$REAL_TARGET"
 
 VERBOSE=0
 [[ "${1:-}" == "-v" || "${1:-}" == "--verbose" ]] && VERBOSE=1
@@ -100,9 +103,9 @@ class H(BaseHTTPRequestHandler):
         if MODE == "http500":
             self._send(500, {"error": "stub: out of memory"})
             return
-        # Fail every request until the warm-up plus the first two have gone by,
-        # so a case still has samples left to take a median over.
-        if MODE == "flaky" and seq <= 2:
+        # Fail the warm-up and the first two repetitions of the first case, so
+        # that case still yields a sample but only one of the three asked for.
+        if MODE == "flaky" and seq <= 3:
             self._send(503, {"error": "stub: warming up"})
             return
         # Only the largest prompt fails, as a context-overflow would.
@@ -110,11 +113,19 @@ class H(BaseHTTPRequestHandler):
             self._send(400, {"error": "stub: prompt exceeds context"})
             return
 
+        # A board that slows down as it heats up: every request is a little
+        # worse than the last. The medians alone cannot tell this apart from a
+        # steady machine, which is what the spread and the steady-state
+        # re-measurement exist to expose.
+        rate = gen / 0.5
+        if MODE == "throttle":
+            rate = max(2.0, 30.0 - 2.0 * seq)
+
         timings = {
             "prompt_n": words, "prompt_ms": 100.0,
             "prompt_per_second": words / 0.1,
             "predicted_n": gen, "predicted_ms": 500.0,
-            "predicted_per_second": gen / 0.5,
+            "predicted_per_second": rate,
         }
         if MODE == "notimings":
             timings = None
@@ -138,6 +149,74 @@ PYEOF
 STUB_LOG="$TMPROOT/requests.jsonl"
 BASE=""
 
+# ── Fixture project ───────────────────────────────────────────────
+# benchmark.sh cd's to its own project directory and reports the .env it finds
+# there as the configuration a measurement was taken under, so running it in
+# place makes the assertions depend on whatever the host happens to be
+# configured for. A copy with a known .env fixes that and lets the KV-cache and
+# context values actually be checked.
+PROJ="$TMPROOT/project"
+mkdir -p "$PROJ/scripts"
+cp "$SCRIPT_DIR"/benchmark.sh "$SCRIPT_DIR"/detect-platform.sh "$PROJ/scripts/"
+cp -r "$SCRIPT_DIR/lib" "$PROJ/scripts/lib"
+cat >"$PROJ/.env" <<'ENVEOF'
+MODEL_FILE=fixture-Q4_K_M.gguf
+CTX_SIZE=4096
+PARALLEL=2
+# K and V are separate knobs; the results file used to record only K, so two
+# runs with different V cache types compared as if they were configured alike.
+CACHE_TYPE_K=q8_0
+CACHE_TYPE_V=f16
+ENVEOF
+TARGET="$PROJ/scripts/benchmark.sh"
+
+# A stub nvpmodel, so the power-mode line is exercised on any host. The real one
+# prints the mode name on a "NV Power Mode" line followed by the mode number.
+cat >"$TMPROOT/nvpmodel" <<'NVEOF'
+#!/usr/bin/env bash
+printf 'NV Power Mode: 25W\n1\n'
+NVEOF
+chmod +x "$TMPROOT/nvpmodel"
+
+# Synthetic thermal trees. BENCH_SYSROOT redirects the sysfs probe, so the
+# thermal report and the throttle threshold can be tested on any machine -
+# including the hot-board case a healthy Jetson will not reproduce on demand.
+# millidegrees are what the kernel exposes.
+make_thermal() {  # make_thermal <dir> <cpu_mC> <gpu_mC>
+  local d="$1/sys/devices/virtual/thermal"
+  mkdir -p "$d"/thermal_zone{0,1,2,3}
+  printf 'cpu-thermal' >"$d/thermal_zone0/type"; printf '%s\n' "$2" >"$d/thermal_zone0/temp"
+  printf 'gpu-thermal' >"$d/thermal_zone1/type"; printf '%s\n' "$3" >"$d/thermal_zone1/temp"
+  # An Orin's cv*-thermal zones are readable by permission but answer EAGAIN.
+  # Both shapes that produces are modelled: a zone with no temp file at all, and
+  # one whose temp reads as nothing. The second is the dangerous one - it used
+  # to reach $(( ... / 1000 )) as an empty string.
+  printf 'cv0-thermal' >"$d/thermal_zone2/type"
+  printf 'cv1-thermal' >"$d/thermal_zone3/type"; : >"$d/thermal_zone3/temp"
+  printf '70000\n' >"$d/thermal_zone0/trip_point_0_temp"
+  printf 'passive\n' >"$d/thermal_zone0/trip_point_0_type"
+  printf '99000\n' >"$d/thermal_zone0/trip_point_1_temp"
+  printf 'critical\n' >"$d/thermal_zone0/trip_point_1_type"
+}
+make_thermal "$TMPROOT/cool" 48000 47000
+make_thermal "$TMPROOT/hot"  84000 81000
+
+# This host's PATH with exactly one binary removed. Anything narrower would
+# change more than the one thing under test, and on a Jetson - where tegrastats
+# is always installed - there is no other way to reach the code path that a
+# machine without it takes.
+NOTEGRA_BIN="$TMPROOT/bin-no-tegrastats"
+mkdir -p "$NOTEGRA_BIN"
+while IFS= read -r -d ':' d || [[ -n "$d" ]]; do
+  [[ -d "$d" ]] || continue
+  for f in "$d"/*; do
+    n="${f##*/}"
+    [[ "$n" == "tegrastats" || -e "$NOTEGRA_BIN/$n" ]] && continue
+    ln -s "$f" "$NOTEGRA_BIN/$n" 2>/dev/null
+  done
+done <<<"$PATH"
+NOTEGRA_PATH="$NOTEGRA_BIN"
+
 # start_stub <mode>
 start_stub() {
   stop_stub
@@ -155,6 +234,13 @@ start_stub() {
   fi
   BASE="http://127.0.0.1:$(cat "$TMPROOT/port")"
 }
+
+# Hermetic defaults: no thermal tree and no nvpmodel unless a case supplies one
+# with a `BENCH_SYSROOT=... run_bench ...` prefix. Without this the assertions
+# would depend on how warm the machine running the tests happens to be.
+mkdir -p "$TMPROOT/nosysfs"
+export BENCH_SYSROOT="$TMPROOT/nosysfs"
+export BENCH_NVPMODEL="/nonexistent"
 
 # run_bench <args...> - captures output in $OUT and status in $RC.
 OUT=""; RC=0
@@ -216,10 +302,10 @@ else
   fail "prompt sizes do not increase" "16w=$n16 512w=$n512"
 fi
 
-# 3 cases x 2 reps + 1 warm-up.
+# 3 cases x 2 reps + 1 warm-up + 1 steady-state re-measurement.
 n_req="$(req_count)"
-if (( n_req == 7 )); then pass "issued 7 requests (3 cases x 2 reps + warm-up)"
-else fail "unexpected request count" "expected 7, got $n_req"; fi
+if (( n_req == 8 )); then pass "issued 8 requests (3 cases x 2 reps + warm-up + steady-state)"
+else fail "unexpected request count" "expected 8, got $n_req"; fi
 
 # Prompt caching must stay off or prompt-eval throughput is measured against a
 # cache hit rather than against the model.
@@ -238,8 +324,9 @@ if python3 -c "
 import json,sys,collections
 rows=[json.loads(l) for l in open(sys.argv[1])]
 c=collections.Counter(len(r['body']['messages'][-1]['content'].split()) for r in rows)
-# warm-up shares the 16-word prompt, so that bucket holds 3
-sys.exit(0 if sorted(c.values())==[2,2,3] else 1)
+# The warm-up and the steady-state re-measurement both reuse the 16-word
+# prompt, so that bucket holds 2 reps + 2.
+sys.exit(0 if sorted(c.values())==[2,2,4] else 1)
 " "$STUB_LOG"; then
   pass "-r 2 sends two requests per case"
 else
@@ -262,6 +349,136 @@ else
   fail "generation length not honoured"
 fi
 
+# ── Run conditions ────────────────────────────────────────────────
+# A throughput figure from a Jetson means nothing without the conditions it was
+# taken under: the power mode caps clocks, the KV cache type changes both memory
+# and bandwidth, and the context size changes what the numbers describe.
+case_start "the conditions the run was taken under are reported"
+start_stub ok
+BENCH_NVPMODEL="$TMPROOT/nvpmodel" run_bench --base "$BASE" -r 2 -n 8
+expect_rc 0 "conditions run"
+expect_out 'Power mode : 25W'
+expect_out 'Context    : 4096 tokens, KV cache q8_0/f16'
+expect_out 'Slots      : 2'
+expect_out 'Reps       : 2 per case, 8 tokens generated'
+
+case_start "no nvpmodel means no power-mode line, not a failure"
+start_stub ok
+run_bench --base "$BASE" -r 1 -n 8
+expect_rc 0 "run without nvpmodel"
+expect_not_out 'Power mode'
+
+# ── Steadiness ────────────────────────────────────────────────────
+# The defect this replaces: the table showed one median per case, so a board
+# that fell from 28 to 4 tok/s while the sweep ran produced a plausible-looking
+# set of numbers that no one could tell apart from a healthy run.
+case_start "a run that steadily degrades is reported, not averaged away"
+start_stub throttle
+run_bench --base "$BASE" -r 3 -n 8 --json "$TMPROOT/throttle.json"
+expect_rc 0 "degradation is the board's property, not a stack failure"
+expect_out 'These numbers are not comparable'
+expect_out 'throughput fell [0-9.]+% between the start and the end of the run'
+expect_out 'repetitions of .* varied by more than 20%'
+expect_out 'Steady state: 16w re-measured at .* \(was .*, -[0-9.]+%\)'
+if python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+ss=d['steady_state']
+assert ss['label']=='16w', ss
+assert ss['drop_pct'] > 15, ss
+assert any('throughput fell' in w for w in d['warnings']), d['warnings']
+first=d['results'][0]
+assert first['tg_spread_pct'] > 0, first
+assert first['tg_min'] < first['tg_max'], first
+assert len(first['tg_samples'])==3, first
+" "$TMPROOT/throttle.json" 2>"$TMPROOT/terr"; then
+  pass "the results file records the spread, the samples and the degradation"
+else
+  fail "degradation not recorded" "$(cat "$TMPROOT/terr")"
+fi
+
+case_start "a steady run reports a zero spread and no warning"
+start_stub ok
+run_bench --base "$BASE" -r 3 -n 8
+expect_rc 0 "steady run"
+expect_out '^16w +[0-9]+ +[0-9.]+ +[0-9.]+ +0\.0% '
+expect_not_out 'These numbers are not comparable'
+expect_out 'Steady state: 16w re-measured at .* \(was .*, \+0\.0%\)'
+
+case_start "a single repetition reports no spread rather than a fake one"
+start_stub ok
+run_bench --base "$BASE" -r 1 -n 8
+expect_rc 0 "single-rep run"
+expect_out '^16w +[0-9]+ +[0-9.]+ +[0-9.]+ +- '
+expect_out 'Values are single measurements'
+expect_not_out 'These numbers are not comparable'
+
+# ── Thermals ──────────────────────────────────────────────────────
+# Reading these used to be gated on tegrastats being on PATH, which contributes
+# nothing to a sysfs read and removed the entire thermal report from any host
+# that does not ship it.
+case_start "thermal zones are read from sysfs, start and end"
+start_stub ok
+BENCH_SYSROOT="$TMPROOT/cool" run_bench --base "$BASE" -r 1 -n 8
+expect_rc 0 "cool board"
+expect_out 'Thermal cpu-thermal +48°C -> 48°C'
+expect_out 'Thermal gpu-thermal +47°C -> 47°C'
+# Zones with no readable temperature must be dropped, not rendered as 0°C or
+# fed as an empty string into $(( ... / 1000 )).
+expect_not_out 'cv0-thermal'
+expect_not_out 'cv1-thermal'
+expect_not_out 'division by 0|syntax error|unbound variable'
+expect_not_out 'These numbers are not comparable'
+
+# The thermal read used to be gated on tegrastats being on PATH, which
+# contributes nothing to a sysfs read. The gate is invisible on a Jetson, where
+# tegrastats is always present - so the case has to be run on a copy of this
+# host's PATH with exactly that one binary missing.
+case_start "thermals do not depend on tegrastats being installed"
+start_stub ok
+BENCH_SYSROOT="$TMPROOT/cool" PATH="$NOTEGRA_PATH" run_bench --base "$BASE" -r 1 -n 8
+expect_rc 0 "host without tegrastats"
+expect_out 'Thermal cpu-thermal +48°C'
+expect_out 'Thermal gpu-thermal +47°C'
+
+case_start "a board already at the passive trip point is called out"
+start_stub ok
+BENCH_SYSROOT="$TMPROOT/hot" run_bench --base "$BASE" -r 1 -n 8 --json "$TMPROOT/hot.json"
+expect_rc 0 "hot board still measures"
+expect_out 'the board reached 84°C, at or above the 70°C passive trip point'
+if python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+t=d['thermal_c']
+assert t['passive_trip']==70.0, t
+assert t['start']['cpu-thermal']==84.0, t
+assert 'cv0-thermal' not in t['end'], t
+assert any('passive trip' in w for w in d['warnings']), d['warnings']
+" "$TMPROOT/hot.json" 2>"$TMPROOT/herr"; then
+  pass "the results file records the thermal readings and the trip point"
+else
+  fail "thermal state not recorded" "$(cat "$TMPROOT/herr")"
+fi
+
+case_start "a host with no thermal tree reports no thermals and no warning"
+start_stub ok
+run_bench --base "$BASE" -r 1 -n 8 --json "$TMPROOT/nothermal.json"
+expect_rc 0 "host without sysfs thermal zones"
+expect_not_out '^Thermal '
+expect_not_out 'These numbers are not comparable'
+if python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d['thermal_c']['start']=={} and d['thermal_c']['end']=={}, d['thermal_c']
+assert d['thermal_c']['passive_trip'] is None, d['thermal_c']
+assert d['warnings']==[], d['warnings']
+assert d['power_mode'] is None, d['power_mode']
+" "$TMPROOT/nothermal.json" 2>"$TMPROOT/nerr"; then
+  pass "absent hardware is recorded as absent, not as zero"
+else
+  fail "absent thermal state mis-recorded" "$(cat "$TMPROOT/nerr")"
+fi
+
 # ── Machine-readable output ───────────────────────────────────────
 case_start "--json writes a usable results file"
 start_stub ok
@@ -276,9 +493,16 @@ d=json.load(open(sys.argv[1]))
 assert len(d['results'])==3, d['results']
 assert d['model']=='/models/stub-Q4_K_M.gguf', d['model']
 assert d['gen_tokens']==8, d['gen_tokens']
+assert d['ctx_size']=='4096', d['ctx_size']
+assert d['parallel']=='2', d['parallel']
+# Recorded as a pair: only K used to be written, so a run with a q8_0 K cache
+# and an f16 V cache compared as identical to one with both quantised.
+assert d['kv_cache']=={'k': 'q8_0', 'v': 'f16'}, d['kv_cache']
+assert d['reps']==1 and d['failed_reps']==0, d
 for r in d['results']:
     assert r['tg_s']>0 and r['pp_s']>0, r
-    assert r['reps']==1, r
+    assert r['reps']==1 and r['reps_requested']==1 and r['failed_reps']==0, r
+    assert r['tg_samples']==[r['tg_s']], r
 " "$TMPROOT/out.json" 2>"$TMPROOT/jsonerr"; then
     pass "results file has 3 measured cases with the run's parameters"
   else
@@ -329,12 +553,18 @@ expect_out '1 of 3 case\(s\) produced no measurement: 512w'
 expect_out '^16w +[0-9]+ '
 expect_out 'exceeds context'
 
-case_start "intermittent failures still yield a measurement"
+# A case that loses some of its repetitions used to print the surviving median
+# under a footer claiming "medians over 3 repetitions" and exit 0. Six of nine
+# requests could 500 with "out of memory" and the run still looked perfect.
+case_start "intermittent failures are measured but reported as incomplete"
 start_stub flaky
 run_bench --base "$BASE" -r 3 -n 8
-expect_rc 0 "surviving samples are enough"
+expect_rc 1 "the sweep was not completed as asked"
 expect_out '^16w '
 expect_not_out 'produced no measurement'
+expect_out '2 of 9 requests failed'
+expect_out '16w 1/3'
+expect_out 'Last error: HTTP 503'
 
 # ── Unreachable server ────────────────────────────────────────────
 case_start "unreachable server is reported, not measured"

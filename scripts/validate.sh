@@ -423,8 +423,10 @@ preflight() {
   # A healthy stack only ever exercises the benchmark's happy path, so the ways
   # it can report a non-measurement as a measurement - a 500 under memory
   # pressure, a stripped timings block, a typo'd repetition count, an unwritable
-  # results path - are invisible here. The self-test drives the real script
-  # against a stub server that produces each of them on demand.
+  # results path, repetitions lost to errors, a board that slowed down while the
+  # sweep ran - are invisible here. The self-test drives the real script against
+  # a stub server that produces each of them on demand, and against synthetic
+  # thermal zones for the hot-board cases this one will not reproduce to order.
   selftest test-benchmark.sh "benchmark"
 
   head "Preflight - bootstrap"

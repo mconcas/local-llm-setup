@@ -101,8 +101,46 @@ silently dropped.
 the numbers reflect the stack as a client sees it. It reports prompt-eval
 throughput (compute bound), generation throughput (memory-bandwidth bound) and
 time to first token, with prompt caching disabled so the prompt-eval figure is
-real. It exits non-zero unless every case produced an actual measurement, so it
-is usable as a gate and not only as something to read.
+real. It exits non-zero unless every case produced an actual measurement and
+every requested repetition succeeded, so it is usable as a gate and not only as
+something to read.
+
+### Reading a benchmark on a Jetson
+
+A number from a passively-cooled, power-capped board is only meaningful together
+with the conditions it was taken under, so the run reports them:
+
+| Column / line  | What it tells you                                                             |
+|----------------|-------------------------------------------------------------------------------|
+| `Power mode`   | Read from `nvpmodel`. A 15 W figure is not comparable to a 25 W/MAXN one.      |
+| `spread`       | `(max-min)/median` of generation throughput across the repetitions of one case. A single median cannot distinguish a steady 12 tok/s from a run that started at 16 and ended at 8. |
+| `Steady state` | The *first* case re-measured once after the sweep. The sweep walks from a short prompt to a long one, so throughput falling down the table says nothing about the board; re-running the same prompt at the end compares like with like, and any drop is the machine. |
+| `Thermal`      | Every readable sysfs zone, start of run → end of run, including `tj-thermal` (the junction temperature that governs throttling on an Orin). |
+
+If the run degraded, or the board reached the first passive trip point (70 °C on
+an Orin Nano - well below the 99 °C most people watch for), the run says so and
+tells you the numbers are not comparable. It still exits 0: throttling is a
+property of the board, not a fault in the stack.
+
+A healthy, cool Orin Nano Super at 15 W looks like this - spreads under 1 %, no
+drift between the first and last measurement, and a rise that stays clear of the
+trip point:
+
+```
+prompt         tokens     pp tok/s     tg tok/s   spread    TTFT ms
+---------------------------------------------------------------------
+16w                62        362.0         13.9     0.1%        171
+128w              253        503.8         13.7     0.3%        502
+512w              903        498.4         13.5     0.2%       1812
+
+Steady state: 16w re-measured at 13.9 tok/s after the sweep (was 13.9, +0.0%)
+Thermal tj-thermal     51°C -> 58°C
+```
+
+`--json` records all of it - every repetition's sample, the spread, the power
+mode, the start and end temperature of each zone, the trip point and any
+warnings - so two runs can be compared on their conditions and not just on their
+medians.
 
 ### Platform detection self-test
 
@@ -135,17 +173,33 @@ so the failure that matters is not a crash but a plausible-looking table that wa
 never a measurement. A healthy Jetson only ever exercises the happy path, which
 is why several of these went unnoticed: a server answering `500` under memory
 pressure, a proxy stripping llama.cpp's per-request `timings` block (every rate
-renders as `0.0`), a typo'd `-r` value producing an empty sweep, and a results
-path that is not writable, which used to print `Wrote <path>` over a shell error
-and discard the run.
+renders as `0.0`), a typo'd `-r` value producing an empty sweep, a results path
+that is not writable, which used to print `Wrote <path>` over a shell error and
+discard the run, and a case that lost most of its repetitions to errors yet
+printed the one surviving sample under a footer claiming a median over three.
 
 `test-benchmark.sh` drives the real script against a stub OpenAI-compatible
 server that produces each of those on demand, with no GPU, model, Docker or
-network. Besides the failure paths it pins the things that make the numbers
-mean anything: that prompt caching stays disabled, that `-r` and `-n` are
-actually honoured, that reported rates are positive, that prompt token counts
-grow across the sweep, and that a bad argument is rejected before any request is
-issued. `validate.sh` runs it as part of preflight.
+network. It runs the script from a copy of the project with a known `.env`, so
+the reported context size and KV cache types are actually checked rather than
+inherited from whatever the host is configured for.
+
+The Jetson-specific conditions get the same treatment, since a healthy board
+will not reproduce them to order. `BENCH_SYSROOT` points the thermal probe at a
+synthetic sysfs tree - a cool board, a board already past its passive trip
+point, and zones that exist but cannot be read (an Orin's `cv*-thermal` zones
+answer `EAGAIN`, and an empty reading used to reach `$(( ... / 1000 ))`).
+`BENCH_NVPMODEL` supplies a stub power-mode probe. A stub server whose
+throughput decays request by request stands in for a throttling board, and the
+thermal read is checked once against a copy of this host's `PATH` with
+`tegrastats` removed - the read never needed it, but it used to be gated on it,
+which silently removed the whole thermal report on any host without it.
+
+Besides those it pins the things that make the numbers mean anything: that
+prompt caching stays disabled, that `-r` and `-n` are actually honoured, that
+reported rates are positive, that prompt token counts grow across the sweep, and
+that a bad argument is rejected before any request is issued. `validate.sh` runs
+it as part of preflight.
 
 ### Moving an `.env` between the two platforms
 
