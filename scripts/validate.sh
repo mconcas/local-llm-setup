@@ -51,7 +51,18 @@ CA_CERT="$PROJECT_DIR/certs/ca.crt"
 HTTP_BASE="http://127.0.0.1:8080"
 HTTPS_BASE="https://localhost:${HTTPS_PORT}"
 
+# detect-platform.sh emits its recommended image as LLAMA_IMAGE - the same name
+# .env uses - so evaluating it here would overwrite the user's value in an
+# already-exported variable, and every `docker compose` call below would then
+# inspect a different image than `docker compose up` runs. Keep the two apart.
+LLAMA_IMAGE_ENV="${LLAMA_IMAGE:-}"
 eval "$(bash "$SCRIPT_DIR/detect-platform.sh" --env 2>/dev/null)" || true
+LLAMA_IMAGE_REC="${LLAMA_IMAGE:-}"
+if [[ -n "$LLAMA_IMAGE_ENV" ]]; then
+  LLAMA_IMAGE="$LLAMA_IMAGE_ENV"
+else
+  unset LLAMA_IMAGE   # let compose fall back to the default in docker-compose.yml
+fi
 
 # `docker compose` needs the same file list the user runs with. COMPOSE_FILE is
 # exported from .env above, so a bare `docker compose` already picks it up.
@@ -170,6 +181,19 @@ preflight() {
     ok "compose config is valid (${COMPOSE_FILE:-docker-compose.yml})"
   else
     no "compose config is invalid" "$(dc config 2>&1 | tail -3)"
+  fi
+
+  # The image is the one setting with no runtime fallback. The upstream CUDA
+  # build carries no sm_87 kernels, so on an Orin it enumerates the GPU, tries
+  # to JIT from PTX and aborts - which reads as a driver problem, not a config
+  # one. The Jetson image is arm64-only and will not pull on x86_64 at all.
+  if [[ -z "$LLAMA_IMAGE_ENV" ]]; then
+    no "LLAMA_IMAGE is not set in .env" "set LLAMA_IMAGE=${LLAMA_IMAGE_REC:-see detect-platform.sh}"
+  elif [[ "$LLAMA_IMAGE_ENV" == "${LLAMA_IMAGE_REC:-}" ]]; then
+    ok "LLAMA_IMAGE is the image for this platform"
+  else
+    no "LLAMA_IMAGE is not the image detected for this platform" \
+       "in .env: ${LLAMA_IMAGE_ENV}; expected: ${LLAMA_IMAGE_REC:-unknown}"
   fi
 
   # MODEL_FILE is a container path under /models; map it back to the host.
@@ -292,6 +316,23 @@ preflight() {
     bfirst="$(grep -E '^ +- ' <<<"$benchtest" | sed -n '1s/^ *- //p')"
     no "benchmark self-test: ${bfail} assertion(s) failed" \
        "first: ${bfirst:-see output}; run ./scripts/test-benchmark.sh for the rest"
+  fi
+
+  head "Preflight - bootstrap"
+
+  # setup.sh writes .env, so anything it gets wrong is inherited by every check
+  # below. Its risky paths all involve the platform this host is not, or an .env
+  # carried over from one. The self-test runs the real script in throwaway
+  # project directories against synthetic /proc trees.
+  local setuptest
+  if setuptest="$(bash "$SCRIPT_DIR/test-setup.sh" 2>&1)"; then
+    ok "setup self-test ($(grep -oE '[0-9]+ assertions passed' <<<"$setuptest" | tail -1))"
+  else
+    local sfail sfirst
+    sfail="$(grep -cE '^ +- ' <<<"$setuptest")"
+    sfirst="$(grep -E '^ +- ' <<<"$setuptest" | sed -n '1s/^ *- //p')"
+    no "setup self-test: ${sfail} assertion(s) failed" \
+       "first: ${sfirst:-see output}; run ./scripts/test-setup.sh for the rest"
   fi
 }
 

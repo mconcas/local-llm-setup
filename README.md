@@ -77,6 +77,7 @@ docker compose up -d
 
 ./scripts/test-detect-platform.sh             # platform detection self-test
 ./scripts/test-benchmark.sh                   # benchmark self-test
+./scripts/test-setup.sh                       # bootstrap self-test
 ./scripts/test-detect-platform.sh -v          # ... printing every assertion
 ```
 
@@ -134,6 +135,43 @@ mean anything: that prompt caching stays disabled, that `-r` and `-n` are
 actually honoured, that reported rates are positive, that prompt token counts
 grow across the sweep, and that a bad argument is rejected before any request is
 issued. `validate.sh` runs it as part of preflight.
+
+### Moving an `.env` between the two platforms
+
+`.env` is portable in form but not in content. The settings that differ between
+an x86_64 workstation and a Jetson are precisely the ones whose failure modes do
+not name themselves:
+
+| Setting | Wrong value on a Jetson | What you see |
+|---|---|---|
+| `COMPOSE_FILE` | without the Jetson overlay | GPU passthrough takes the legacy `--gpus` path, which wedges the Docker daemon on JetPack 6 |
+| `LLAMA_IMAGE` | the upstream CUDA image | the GPU is enumerated, then the server aborts trying to JIT from PTX - it carries no `sm_87` kernels |
+| `PARALLEL` | more slots than the board holds | the KV cache is N× larger and the container is OOM-killed mid-request |
+| `CACHE_TYPE_K` / `_V` | `f16` | the KV cache is twice the size it needs to be, on the machine with the least memory |
+
+So `setup.sh` re-reads the hardware on every run and reports where the existing
+`.env` disagrees with it, with the value to set. It never edits an existing
+`.env` - the one exception is `MODEL_FILE`, which is repointed when it names a
+file that is not there and exactly one model is, since that value is otherwise
+guaranteed to crash-loop the container. It exits 0 either way; `validate.sh` is
+the gate, and now also checks `LLAMA_IMAGE`.
+
+### Bootstrap self-test
+
+`setup.sh` is the first thing a user runs and the only script that writes
+`.env`, so what it gets wrong is inherited by everything downstream - including
+the rest of the validation suite. Its risky paths are again the ones a healthy
+machine never takes: they involve the *other* platform, a `MODELS_DIR` on a data
+disk, or a `MODEL_FILE` naming a model that has since been pruned. Each of those
+used to end in `Setup complete` and exit 0.
+
+`test-setup.sh` runs the real script in throwaway project directories against
+synthetic `/proc` trees and stub `docker`/`nvidia-smi`/`python3` binaries, so no
+GPU, Docker, network or model is needed and the real `.env` is never touched. It
+covers a fresh checkout on either platform, an `.env` carried in each direction,
+a pruned or ambiguous `MODEL_FILE`, models on a data disk, `.env` values that are
+not shell-safe, a failing platform probe, idempotence, and JetPack's missing
+`python3-venv`. `validate.sh` runs it as part of preflight.
 
 ## Disk usage
 
@@ -350,7 +388,8 @@ rm -rf certs/
 │   └── nginx.conf              # TLS reverse proxy config
 ├── docker-compose.jetson.yml   # Jetson overlay (CDI GPU passthrough)
 ├── scripts/
-│   ├── setup.sh                # Bootstrap script
+│   ├── setup.sh                # Bootstrap + .env/platform consistency check
+│   ├── test-setup.sh           # Hermetic tests for the bootstrap
 │   ├── detect-platform.sh      # Hardware detection + tuned defaults
 │   ├── gen-certs.sh            # TLS certificate generator
 │   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
