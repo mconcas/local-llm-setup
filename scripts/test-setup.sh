@@ -351,6 +351,34 @@ run_setup "$P" "$JETSON_SYSROOT"
 assert_eq "$(envval "$P" MODEL_FILE)" "/models/data-disk-model.gguf" "finds models on the data disk"
 assert_contains "$OUT" "Models found in $DATA" "lists them from the data disk"
 
+# A bind source is not a shell path. Both forms below are things a user writes
+# by hand, and both put the model somewhere the container never mounts - the
+# bare one stops compose from parsing the project at all, and the tilde one is
+# expanded by compose but not by bash, so setup.sh would create a directory
+# literally named '~' and report the model in it as present.
+new_project
+run_setup "$P" "$JETSON_SYSROOT"
+sed -i "s|^MODELS_DIR=.*|MODELS_DIR=models|" "$P/.env"
+run_setup "$P" "$JETSON_SYSROOT"
+assert_contains "$OUT" "is not a directory compose can bind-mount" "a bare relative MODELS_DIR is reported"
+assert_contains "$OUT" "write ./models" "says what to write instead"
+assert_not_contains "$OUT" "Setup complete" "and is counted as outstanding"
+
+new_project
+run_setup "$P" "$JETSON_SYSROOT"
+sed -i "s|^MODELS_DIR=.*|MODELS_DIR=~/models|" "$P/.env"
+# HOME points into the fixture: `~` is expanded by the script under test, so
+# letting it reach the real home directory would create one there.
+FAKE_HOME="$TMPROOT/home$PROJ_N"; mkdir -p "$FAKE_HOME"
+OUT="$(cd "$P" && PATH="$STUBBIN:$PATH" HOME="$FAKE_HOME" \
+    PLATFORM_SYSROOT="$JETSON_SYSROOT" PLATFORM_NVIDIA_SMI=nvidia-smi \
+    bash "$P/scripts/setup.sh" 2>&1)"
+assert_contains "$OUT" "$FAKE_HOME/models" "expands ~ the way compose does"
+[[ -d "$FAKE_HOME/models" ]] && pass "creates the directory compose will mount" \
+                             || fail "creates the directory compose will mount"
+[[ -d "$P/~" ]] && fail "does not create a directory literally named ~" \
+                || pass "does not create a directory literally named ~"
+
 # ══════════════════════════════════════════════════════════════════
 case_start ".env values that are not shell-safe"
 # ══════════════════════════════════════════════════════════════════

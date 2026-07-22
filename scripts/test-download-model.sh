@@ -504,6 +504,32 @@ else
   fail "CRLF .env was mis-parsed" "rc=$RC out=$(tr '\n' '|' <<<"$OUT" | cut -c1-200)"
 fi
 
+# A bind source is not a shell path: compose reads a bare relative value as a
+# named volume, so the project does not even parse - and this script would
+# otherwise have spent several GB before anyone found out.
+new_project
+start_stub ok
+printf 'MODELS_DIR=models\n' >"$PROJ/.env"
+run_dl acme/Qwen3-GGUF bare.gguf
+expect_rc 2 "a bare relative MODELS_DIR"
+expect_out 'bind-mounted'
+expect_out 'write ./models'
+if [[ -e "$PROJ/models/bare.gguf" ]]; then fail "downloaded anyway"; else pass "nothing was downloaded"; fi
+
+# ~ is expanded by compose but not by bash, so the untouched form would write
+# several GB into a directory literally named '~'.
+new_project
+start_stub ok
+FAKE_HOME="$TMPROOT/home$PROJ_N"; mkdir -p "$FAKE_HOME"
+printf 'MODELS_DIR=~/models\n' >"$PROJ/.env"
+OUT="$(cd "$PROJ" && HOME="$FAKE_HOME" PATH="$CLEAN_PATH" HF_ENDPOINT="$ENDPOINT" \
+       bash "$PROJ/scripts/download-model.sh" acme/Qwen3-GGUF tilde.gguf 2>&1)"; RC=$?
+expect_rc 0 "a ~-relative MODELS_DIR"
+if [[ -f "$FAKE_HOME/models/tilde.gguf" ]]; then pass "writes where compose will mount"
+else fail "writes where compose will mount" "not at $FAKE_HOME/models/tilde.gguf"; fi
+if [[ -e "$PROJ/~" ]]; then fail "does not create a directory literally named ~"
+else pass "does not create a directory literally named ~"; fi
+
 new_project
 start_stub ok
 MODELS="$PROJ/models"

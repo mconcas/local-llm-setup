@@ -23,6 +23,7 @@ echo ""
 # validate.sh so all three resolve a value the way compose does.
 ENV_FILE="$PROJECT_DIR/.env"
 . "$SCRIPT_DIR/lib/env.sh"
+ENV_PROJECT_DIR="$PROJECT_DIR"   # compose resolves a relative bind source against this
 
 MISMATCHES=0
 mismatch() {
@@ -100,9 +101,24 @@ echo "==> Checking .env against this platform …"
 # a missing bind-mount source makes the Docker daemon materialise it as a
 # root-owned empty directory, so the model the user downloaded is simply not
 # there and the container reports a missing file it can see nothing wrong with.
-MODEL_DIR_HOST="$(env_get MODELS_DIR)"
-MODEL_DIR_HOST="${MODEL_DIR_HOST:-./models}"
-mkdir -p "$MODEL_DIR_HOST"
+#
+# Resolve it the way compose resolves a bind source rather than the way bash
+# resolves a path - the two disagree on a leading `~` (compose expands it, bash
+# in quotes does not) and on a bare relative path (a named volume to compose, an
+# ordinary directory to bash). Either disagreement puts the model somewhere the
+# container never reads.
+MODEL_DIR_RAW="$(env_get MODELS_DIR)"
+MODEL_DIR_RAW="${MODEL_DIR_RAW:-./models}"
+if MODEL_DIR_HOST="$(env_bind_path "$MODEL_DIR_RAW" 2>/dev/null)"; then
+  mkdir -p "$MODEL_DIR_HOST"
+else
+  mismatch "MODELS_DIR=$MODEL_DIR_RAW is not a directory compose can bind-mount." \
+           "$(env_bind_path "$MODEL_DIR_RAW" 2>&1 >/dev/null)" \
+           "\`docker compose up\` fails before starting anything: \"refers to undefined volume\"."
+  # Keep going with the path as bash reads it so the rest of the run still
+  # reports something useful about the model files that are there.
+  MODEL_DIR_HOST="$MODEL_DIR_RAW"
+fi
 HTTPS_PORT="$(env_get HTTPS_PORT)"
 
 CUR_COMPOSE="$(env_get COMPOSE_FILE)"

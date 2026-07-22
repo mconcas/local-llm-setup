@@ -48,10 +48,18 @@ ENV_FILE="$PROJECT_DIR/.env"
 # ./models here would silently download into the repo on any host that points
 # MODELS_DIR at a data disk - the container would never see the file, and the
 # several GB would sit on the wrong filesystem unnoticed.
-MODEL_DIR="$(env_get MODELS_DIR)"
-MODEL_DIR="${MODEL_DIR:-./models}"
-# Resolve relative paths against the project, not the caller's cwd.
-[[ "$MODEL_DIR" != /* ]] && MODEL_DIR="$PROJECT_DIR/${MODEL_DIR#./}"
+MODEL_DIR_RAW="$(env_get MODELS_DIR)"
+MODEL_DIR_RAW="${MODEL_DIR_RAW:-./models}"
+# env_bind_path applies compose's rules for a bind source (a leading `~` is
+# expanded, a bare relative path is a named volume and not a directory at all),
+# so several GB cannot land somewhere the container will not mount.
+ENV_PROJECT_DIR="$PROJECT_DIR"   # compose resolves a relative source against this
+if ! MODEL_DIR="$(env_bind_path "$MODEL_DIR_RAW" 2>/dev/null)"; then
+  echo "MODELS_DIR=$MODEL_DIR_RAW cannot be bind-mounted by compose:" >&2
+  echo "  $(env_bind_path "$MODEL_DIR_RAW" 2>&1 >/dev/null)" >&2
+  echo "Nothing was downloaded - fix MODELS_DIR in .env first." >&2
+  exit 2
+fi
 
 usage() {
   cat <<EOF

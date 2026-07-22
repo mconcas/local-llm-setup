@@ -50,10 +50,14 @@ else
 fi
 
 ok()   { PASS=$((PASS+1)); printf '  %sPASS%s  %s\n' "$C_OK" "$C_Z" "$1"; }
+# Every argument after the first is an advice line. They are printed, not just
+# the second: a `no` call with three lines of advice used to show two and drop
+# the last one silently, which is the wrong end of the message to lose.
+detail() { local line; shift; for line in "$@"; do [[ -n "$line" ]] && printf '        %s\n' "$line"; done; return 0; }
 no()   { FAIL=$((FAIL+1)); FAILED_NAMES+=("$1"); printf '  %sFAIL%s  %s\n' "$C_NO" "$C_Z" "$1"
-         [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; return 0; }
+         detail "$@"; }
 skip() { SKIP=$((SKIP+1)); printf '  %sSKIP%s  %s\n' "$C_SK" "$C_Z" "$1"
-         [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; return 0; }
+         detail "$@"; }
 head() { printf '\n%s%s%s\n' "$C_HD" "$1" "$C_Z"; }
 
 # ── Configuration ─────────────────────────────────────────────────
@@ -64,6 +68,7 @@ head() { printf '\n%s%s%s\n' "$C_HD" "$1" "$C_Z"; }
 # an invisible CR. See lib/env.sh.
 ENV_FILE="$PROJECT_DIR/.env"
 . "$SCRIPT_DIR/lib/env.sh"
+ENV_PROJECT_DIR="$PROJECT_DIR"   # compose resolves a relative bind source against this
 env_load
 
 HTTPS_PORT="${HTTPS_PORT:-8443}"
@@ -196,19 +201,35 @@ preflight() {
            "set COMPOSE_FILE=${COMPOSE_FILES:-docker-compose.yml:docker-compose.jetson.yml} in .env"
       fi
 
-      local cfg
-      cfg="$(dc config 2>/dev/null)"
-      if grep -q 'nvidia.com/gpu=all' <<<"$cfg"; then
-        ok "merged config requests the GPU over CDI"
+      # The two checks below read the *merged* config, and a config that does
+      # not render at all contains neither string - so a project compose cannot
+      # parse would report "legacy reservation is cleared" as a pass. Establish
+      # that there is a config to inspect first.
+      local cfg cfg_err
+      cfg_err="$(mktemp)"
+      if cfg="$(dc config 2>"$cfg_err")"; then
+        if grep -q 'nvidia.com/gpu=all' <<<"$cfg"; then
+          ok "merged config requests the GPU over CDI"
+        else
+          no "merged config has no CDI device request"
+        fi
+        # The overlay clears the inherited reservation with compose's `!reset`
+        # tag. A release too old to know the tag does not ignore it - it
+        # refuses the whole project - so this going green means the tag both
+        # parsed and took effect.
+        if grep -q 'driver: nvidia' <<<"$cfg"; then
+          no "merged config still carries the legacy nvidia device reservation" \
+             "this reintroduces the JetPack 6 ldconfig hang"
+        else
+          ok "legacy nvidia device reservation is cleared by the overlay's !reset"
+        fi
       else
-        no "merged config has no CDI device request"
+        no "the merged compose config does not render" \
+           "$(command head -2 <<<"$(cat "$cfg_err"; printf '%s' "$cfg")")" \
+           "if this names a tag, docker compose is too old for the overlay's !reset (needs v2.24+)"
+        skip "cannot check GPU passthrough wiring - the merged config does not render"
       fi
-      if grep -q 'driver: nvidia' <<<"$cfg"; then
-        no "merged config still carries the legacy nvidia device reservation" \
-           "this reintroduces the JetPack 6 ldconfig hang"
-      else
-        ok "legacy nvidia device reservation is cleared"
-      fi
+      rm -f "$cfg_err"
       ;;
     nvidia-discrete)
       if dc config 2>/dev/null | grep -q 'driver: nvidia'; then
@@ -248,8 +269,24 @@ preflight() {
   # on `set -u` with a raw "unbound variable", which skipped every check after
   # it - disk hygiene, TLS and all four self-tests - and printed no summary,
   # while exiting 1 exactly like an ordinary failed check.
+  # MODELS_DIR is a bind *source*, and compose's rules for one are not bash's:
+  # a leading `~` is expanded, and a bare relative path names a volume rather
+  # than a directory. Resolving it as a shell path is how a model several GB
+  # large ends up reported as present while the container mounts an empty
+  # directory somewhere else entirely.
+  local mdir_raw="${MODELS_DIR:-./models}"
+  local mdir_why=""
+  if MODELS_DIR_HOST="$(env_bind_path "$mdir_raw" 2>/dev/null)"; then
+    ok "MODELS_DIR is a path compose can bind-mount ($mdir_raw)"
+  else
+    mdir_why="$(env_bind_path "$mdir_raw" 2>&1 >/dev/null)"
+    no "MODELS_DIR=$mdir_raw is not a path compose can bind-mount" "$mdir_why" \
+       "the project fails to parse: \"refers to undefined volume\""
+    MODELS_DIR_HOST="$mdir_raw"
+  fi
+
   local mfile="${MODEL_FILE:-}"
-  local host_model="${MODELS_DIR:-./models}/${mfile#/models/}"
+  local host_model="${MODELS_DIR_HOST}/${mfile#/models/}"
   if [[ -z "${MODEL_FILE:-}" ]]; then
     no "MODEL_FILE is not set in .env" "run ./scripts/setup.sh to write one"
   elif [[ "${MODEL_FILE}" != /models/* ]]; then
@@ -284,7 +321,7 @@ preflight() {
 
   head "Preflight - disk hygiene"
 
-  local model_dir_host="${MODELS_DIR:-./models}"
+  local model_dir_host="$MODELS_DIR_HOST"
 
   # A GGUF starts with the ASCII magic "GGUF". Anything else here is a failed
   # download wearing a .gguf name - an HTTP error body, an HTML login page or a
@@ -369,6 +406,17 @@ preflight() {
   # from a host whose certificates are already fine. The self-test drives the
   # real script through each of them and finishes with a TLS handshake.
   selftest test-gen-certs.sh "certificate generation"
+
+  head "Preflight - deployment configuration"
+
+  # docker-compose.yml, its Jetson overlay and nginx.conf are the files every
+  # check here talks *about* and none of them exercise. Their failures are not
+  # visible in a static reading: nginx's 1 MiB default body limit is not written
+  # anywhere, and a bind source is not a shell path (compose expands `~` and
+  # reads a bare relative path as a named volume), so MODELS_DIR can send the
+  # model somewhere the container never mounts. The self-test renders the real
+  # merged config for both platforms and runs the real nginx.conf.
+  selftest test-compose.sh "deployment configuration"
 
   head "Preflight - benchmark"
 

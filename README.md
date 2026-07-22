@@ -77,6 +77,7 @@ docker compose up -d
 ./scripts/benchmark.sh --base http://jetson.local:8080   # measure another host
 
 ./scripts/test-detect-platform.sh             # platform detection self-test
+./scripts/test-compose.sh                     # deployment configuration self-test
 ./scripts/test-benchmark.sh                   # benchmark self-test
 ./scripts/test-setup.sh                       # bootstrap self-test
 ./scripts/test-download-model.sh              # model acquisition self-test
@@ -88,7 +89,7 @@ docker compose up -d
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
 merge, model sizing, disk hygiene, container health, full GPU layer offload, the
 OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
-rejects clients which do not trust the CA). It is **42 checks, all green** on a
+rejects clients which do not trust the CA). It is **44 checks, all green** on a
 Jetson Orin Nano Super with the stack up.
 
 Every self-test above also runs as a preflight check, so `./scripts/validate.sh`
@@ -242,9 +243,46 @@ free-space refusal, `--prune`, `--recommended` against a synthetic Jetson,
 and the `huggingface-cli` path - which is a separate transfer path that must be
 verified the same way. `validate.sh` runs it as part of preflight.
 
+### Deployment configuration self-test
+
+`docker-compose.yml`, the Jetson overlay and `nginx/nginx.conf` are what a user
+actually runs, and until now they were the only files every check talked *about*
+and none of them exercised. Their failure modes are invisible in a static
+reading:
+
+- the overlay clears the base file's GPU reservation with compose's `!reset`
+  tag, because compose merges lists by *appending* - requesting the GPU twice
+  reintroduces the JetPack 6 hang the CDI path exists to avoid. A compose
+  release too old for the tag does not ignore it, it refuses the whole project
+  and the error names a YAML tag rather than the version.
+- a bind source is not a shell path. Compose expands a leading `~` and treats a
+  bare relative path (`MODELS_DIR=models`) as a *named volume*, so the same
+  string can send several GB to a directory the container never mounts - with
+  every script reporting the model as present, because bash resolves it
+  differently.
+- nginx defaults to a 1 MiB request body. A long document or a chat history near
+  a large context window came back as a bare `413` that llama.cpp never saw,
+  while the identical request succeeded against `127.0.0.1:8080` - so the proxy
+  looked like the only broken client.
+
+`test-compose.sh` renders the real merged configuration for both platforms with
+`docker compose config` (client-side; it never contacts the daemon) and asserts
+what the container actually gets: the CDI request present and the legacy
+reservation gone on Jetson, the raw port published on loopback only, both
+model mounts read-only, every `.env` knob reaching the environment variable
+llama.cpp reads, and the proxy waiting for a healthy server. `MODELS_DIR` is
+checked *differentially* - for every legal form (`./models`, absolute, `~/…`,
+`${HOME}/…`, an inline comment, CRLF, `..` and a symlink in the path) what
+`lib/env.sh` tells the scripts must equal what compose mounts. The nginx half
+runs the real `nginx.conf` in a container against a stub upstream and asserts
+the TLS handshake, the forwarded headers and a 3 MB prompt going through - plus
+that the same prompt is a `413` once the body limit is removed, so the assertion
+cannot pass for the wrong reason. It is skipped, with the reason printed, when
+the Docker daemon or the nginx image is unavailable.
+
 ### The validation suite's own self-test
 
-"42/42 green" is only worth something if a red condition actually turns a check
+"44/44 green" is only worth something if a red condition actually turns a check
 red. On healthy hardware every check reports PASS - which is also exactly what a
 check that *cannot* fail reports, and two of them could not: the "rejects
 clients that do not trust the CA" check passed against an nginx that was down
@@ -344,7 +382,19 @@ with platform-appropriate values filled in):
 | `HTTPS_PORT`   | `8443`                       | Port exposed for HTTPS                                    |
 
 `MODELS_DIR` exists so models can live on a separate data disk without a
-machine-specific symlink in the repository.
+machine-specific symlink in the repository. It is a compose *bind source*, not a
+shell path, and the difference is not cosmetic:
+
+| Written as            | What happens                                                          |
+|-----------------------|-----------------------------------------------------------------------|
+| `./models`, `/data/m` | Mounted as written (relative resolves against the repository)          |
+| `~/models`            | Expanded by compose; the scripts expand it the same way                |
+| `${HOME}/models`      | Interpolated by compose; the scripts interpolate the same way          |
+| `models`              | **A named volume**, not a directory - the project fails to parse       |
+
+`setup.sh`, `download-model.sh` and `validate.sh` all resolve it through the same
+reader, so a value compose cannot mount is reported before anything is
+downloaded, and one it mounts *elsewhere* is never counted as present.
 
 ## OpenAI-Compatible API
 
@@ -525,6 +575,7 @@ TLS stack will accept. It needs no GPU, Docker, model or network, and
 │   ├── validate.sh             # End-to-end validation suite
 │   ├── test-validate.sh        # Hermetic tests for the validation suite
 │   ├── test-detect-platform.sh # Hermetic tests for platform detection
+│   ├── test-compose.sh         # Hermetic tests for the compose files + nginx.conf
 │   ├── benchmark.sh            # Throughput benchmark
 │   └── test-benchmark.sh       # Hermetic tests for the benchmark
 ├── models/                     # GGUF model files (git-ignored)
@@ -564,6 +615,15 @@ detected by name, with the fix in the message.
   `CACHE_TYPE_K=q8_0` and `CACHE_TYPE_V=q8_0`, or use a smaller quantisation.
 - Free the page cache first if a large file was just written:
   `sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'`
+
+**`413 Request Entity Too Large`, but only over HTTPS:**
+- The proxy is enforcing a body limit the raw port does not have. `nginx.conf`
+  sets `client_max_body_size 64m`; an older copy left nginx's 1 MiB default.
+- nginx reads its configuration only at startup: `docker compose restart nginx`.
+
+**`refers to undefined volume` / `invalid compose project`:**
+- `MODELS_DIR` is a bare relative path, which compose reads as the name of a
+  volume. Write `./models`, not `models` (see [Configuration](#configuration)).
 
 **Model loading is slow:**
 - Increase `GPU_LAYERS` (default `-1` = all) to offload more to GPU

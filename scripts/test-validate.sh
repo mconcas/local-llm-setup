@@ -602,6 +602,31 @@ echo 1 >"$P/.dockerstub/config.rc"
 printf 'services.llama-server.image: invalid interpolation\n' >"$P/.dockerstub/config.out"
 run_jetson "$P" --preflight
 assert_fail "$OUT" "compose config is invalid" "an unmergeable compose set is caught"
+# The GPU checks read the merged config, and a config that does not render
+# contains no legacy reservation either - so reporting one as cleared here is a
+# pass handed out for the stack being more broken, not less.
+assert_fail "$OUT" "the merged compose config does not render" "the render failure is reported"
+assert_not_contains "$OUT" "legacy nvidia device reservation is cleared" \
+  "does not credit a config that does not exist"
+assert_contains "$OUT" "too old for the overlay" "names the likely cause"
+
+# A bare relative MODELS_DIR is a *named volume* to compose, not a directory:
+# every script here writes to ./models and compose refuses the whole project.
+new_project; healthy_env "$P" "MODELS_DIR=models"
+mkdir -p "$P/models"
+run_jetson "$P" --preflight
+assert_fail "$OUT" "is not a path compose can bind-mount" "a bare relative MODELS_DIR is caught"
+assert_contains "$OUT" "write ./models" "says what to write instead"
+
+# The dangerous one: compose expands a leading ~, bash in quotes does not. The
+# model is written to a directory literally named '~' and the container mounts
+# an empty \$HOME/models, so a check that stats the path as bash reads it is
+# green while the container crash-loops.
+new_project; healthy_env "$P" "MODELS_DIR=~/models"
+mkdir -p "$P/~/models"; printf 'GGUF\x03\x00\x00\x00' >"$P/~/models/tiny.gguf"
+run_jetson "$P" --preflight
+assert_fail "$OUT" "model file not found" "does not accept a model under a literal ~ directory"
+assert_pass "$OUT" "MODELS_DIR is a path compose can bind-mount" "the ~ form itself is legal"
 
 new_project; healthy_env "$P"
 rm -f "$P/certs/ca.crt" "$P/certs/server.crt"
