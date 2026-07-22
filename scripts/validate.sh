@@ -275,6 +275,24 @@ preflight() {
   else
     no "TLS certificates missing" "run: ./scripts/setup.sh <hostname-or-ip>"
   fi
+
+  head "Preflight - benchmark"
+
+  # A healthy stack only ever exercises the benchmark's happy path, so the ways
+  # it can report a non-measurement as a measurement - a 500 under memory
+  # pressure, a stripped timings block, a typo'd repetition count, an unwritable
+  # results path - are invisible here. The self-test drives the real script
+  # against a stub server that produces each of them on demand.
+  local benchtest
+  if benchtest="$(bash "$SCRIPT_DIR/test-benchmark.sh" 2>&1)"; then
+    ok "benchmark self-test ($(grep -oE '[0-9]+ passed' <<<"$benchtest" | tail -1))"
+  else
+    local bfail bfirst
+    bfail="$(grep -cE '^ +- ' <<<"$benchtest")"
+    bfirst="$(grep -E '^ +- ' <<<"$benchtest" | sed -n '1s/^ *- //p')"
+    no "benchmark self-test: ${bfail} assertion(s) failed" \
+       "first: ${bfirst:-see output}; run ./scripts/test-benchmark.sh for the rest"
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════════

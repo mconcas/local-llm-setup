@@ -12,11 +12,15 @@
 # On Jetson tg is usually the limiting factor: the iGPU shares LPDDR with the
 # CPU, so effective bandwidth is far below a discrete card's.
 #
+# Exit status is 0 only if every case produced a real measurement, so this is
+# usable as a gate rather than something a human has to eyeball.
+#
 # Usage:
 #   ./scripts/benchmark.sh                 # default sweep
 #   ./scripts/benchmark.sh -r 5            # 5 repetitions per case
 #   ./scripts/benchmark.sh -n 256          # generate 256 tokens per case
 #   ./scripts/benchmark.sh --json out.json # also write machine-readable results
+#   ./scripts/benchmark.sh --base http://jetson.local:8080   # another host (-b)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,19 +31,36 @@ REPS=3
 GEN_TOKENS=128
 JSON_OUT=""
 PROMPT_WORDS=(16 128 512)
+# Overridable so the same script can measure a remote Jetson from a workstation,
+# and so the self-test can point it at a stub server.
+BASE="${BENCH_BASE:-http://127.0.0.1:8080}"
+
+# A missing option value used to surface as a raw "$2: unbound variable" from
+# bash; take the argument only when there is one.
+need_val() {
+  [[ $# -ge 2 && -n "$2" ]] || { echo "Option $1 requires a value." >&2; exit 2; }
+}
+# seq(1) accepts anything and then produces nothing, which turned a typo'd
+# repetition count into a full sweep of silently "failed" cases.
+need_pos() {
+  [[ "$2" =~ ^[0-9]+$ ]] && (( 10#$2 > 0 )) || {
+    echo "Option $1 needs a positive integer (got: $2)." >&2; exit 2; }
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -r|--reps)   REPS="$2"; shift 2 ;;
-    -n|--tokens) GEN_TOKENS="$2"; shift 2 ;;
-    --json)      JSON_OUT="$2"; shift 2 ;;
-    -h|--help)   sed -n '2,20p' "$0"; exit 0 ;;
+    -r|--reps)   need_val "$@"; need_pos "$1" "$2"; REPS="$2"; shift 2 ;;
+    -n|--tokens) need_val "$@"; need_pos "$1" "$2"; GEN_TOKENS="$2"; shift 2 ;;
+    --json)      need_val "$@"; JSON_OUT="$2"; shift 2 ;;
+    -b|--base)   need_val "$@"; BASE="${2%/}"; shift 2 ;;
+    # Print the header comment up to the first line of code, rather than a
+    # hardcoded line range that silently drifts as the header is edited.
+    -h|--help)   awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac
 done
 
 [[ -f .env ]] && set -a && . ./.env && set +a
-BASE="http://127.0.0.1:8080"
 
 eval "$(bash "$SCRIPT_DIR/detect-platform.sh" --env 2>/dev/null)" || true
 
@@ -47,6 +68,18 @@ if ! curl -sf --max-time 10 "$BASE/health" >/dev/null 2>&1; then
   echo "The llama.cpp server is not reachable at $BASE."
   echo "Start it first:  docker compose up -d"
   exit 1
+fi
+
+# The destination has to be writable before the sweep, not after it: a failed
+# redirect at the end used to print "Wrote <path>" over a shell error and still
+# exit 0, throwing away several minutes of measurements.
+if [[ -n "$JSON_OUT" ]]; then
+  # The subshell keeps bash's own redirect error off the terminal; the message
+  # below is the one the user should see.
+  if ! ( : >"$JSON_OUT" ) 2>/dev/null; then
+    echo "Cannot write results to $JSON_OUT." >&2
+    exit 2
+  fi
 fi
 
 MODEL="$(curl -sf "$BASE/v1/models" 2>/dev/null \
@@ -89,10 +122,14 @@ print('Summarise the following word list. ' + ' '.join(words[i % len(words)] for
 # One timed request. Prompt caching is disabled: with it on, a repeated prompt
 # is served from the KV cache and prompt-eval throughput is reported against a
 # handful of uncached tokens, which is not a measurement of anything.
+#
+# Always prints one JSON object. A failed request reports {"error": ...} rather
+# than dying, so the caller can tell the user *why* a case produced no numbers
+# instead of printing a bare "failed".
 run_once() {
   local prompt="$1"
   python3 - "$BASE" "$GEN_TOKENS" <<'PY' "$prompt"
-import json, sys, time, urllib.request
+import json, sys, time, urllib.error, urllib.request
 base, gen = sys.argv[1], int(sys.argv[2])
 prompt = sys.argv[3]
 body = json.dumps({
@@ -103,10 +140,23 @@ body = json.dumps({
 req = urllib.request.Request(base + "/v1/chat/completions", data=body,
                              headers={"Content-Type": "application/json"})
 t0 = time.time()
-with urllib.request.urlopen(req, timeout=600) as r:
-    d = json.load(r)
+try:
+    with urllib.request.urlopen(req, timeout=600) as r:
+        d = json.load(r)
+except urllib.error.HTTPError as e:
+    detail = (e.read(200) or b"").decode("utf-8", "replace").replace("\n", " ").strip()
+    print(json.dumps({"error": "HTTP %d %s" % (e.code, detail)})); raise SystemExit
+except Exception as e:
+    print(json.dumps({"error": "%s: %s" % (type(e).__name__, e)})); raise SystemExit
 wall = time.time() - t0
-t = d.get("timings", {})
+
+# llama.cpp reports per-request timings; a proxy or a build that strips them
+# leaves every rate at 0.0, which must not read as a measurement of zero.
+t = d.get("timings") or {}
+if not t.get("predicted_per_second"):
+    print(json.dumps({"error": "response carried no timings block "
+                               "(is something proxying /v1/chat/completions?)"}))
+    raise SystemExit
 print(json.dumps({
     "prompt_n":  t.get("prompt_n", 0),
     "pp_s":      t.get("prompt_per_second", 0.0),
@@ -118,10 +168,19 @@ print(json.dumps({
 PY
 }
 
+# Extract .error from a run_once result, empty if it succeeded.
+err_of() { python3 -c "
+import json,sys
+try: print(json.loads(sys.argv[1]).get('error') or '')
+except Exception: print('no response from the server')
+" "$1"; }
+
 echo "Warming up …"
 run_once "$(make_prompt 16)" >/dev/null 2>&1
 
 RESULTS_JSON="[]"
+FAILED_CASES=()
+LAST_ERR=""
 printf '%-12s %8s %12s %12s %10s\n' "prompt" "tokens" "pp tok/s" "tg tok/s" "TTFT ms"
 printf '%s\n' "-------------------------------------------------------------"
 
@@ -130,7 +189,11 @@ for w in "${PROMPT_WORDS[@]}"; do
   samples="[]"
   for _ in $(seq 1 "$REPS"); do
     out="$(run_once "$prompt" 2>/dev/null)"
-    [[ -z "$out" ]] && continue
+    case_err="$(err_of "$out")"
+    if [[ -n "$case_err" ]]; then
+      LAST_ERR="$case_err"
+      continue
+    fi
     samples="$(python3 -c "
 import json,sys
 s=json.loads(sys.argv[1]); s.append(json.loads(sys.argv[2])); print(json.dumps(s))
@@ -151,6 +214,7 @@ print(json.dumps({'label': label, 'prompt_tokens': n, 'gen_tokens': int(med('gen
 
   if [[ "$line" == "SKIP" || -z "$line" ]]; then
     printf '%-12s %8s %12s %12s %10s\n' "${w}w" "-" "failed" "-" "-"
+    FAILED_CASES+=("${w}w")
     continue
   fi
 
@@ -201,5 +265,20 @@ print(json.dumps(out, indent=2))
     "${MODEL:-}" "${CTX_SIZE:-}" "${CACHE_TYPE_K:-f16}" "${PARALLEL:-}" \
     "$POWER_MODE" "$GEN_TOKENS" > "$JSON_OUT"
   echo ""
-  echo "Wrote $JSON_OUT"
+  if [[ -s "$JSON_OUT" ]]; then
+    echo "Wrote $JSON_OUT"
+  else
+    echo "Failed to write $JSON_OUT" >&2
+    exit 1
+  fi
 fi
+
+# A benchmark that measured nothing must not look like a benchmark that measured
+# well. Anything short of every case succeeding is a non-zero exit.
+if (( ${#FAILED_CASES[@]} > 0 )); then
+  echo ""
+  echo "${#FAILED_CASES[@]} of ${#PROMPT_WORDS[@]} case(s) produced no measurement: ${FAILED_CASES[*]}"
+  [[ -n "$LAST_ERR" ]] && echo "Last error: $LAST_ERR"
+  exit 1
+fi
+exit 0

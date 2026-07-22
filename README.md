@@ -73,8 +73,10 @@ docker compose up -d
 ./scripts/benchmark.sh                        # throughput sweep
 ./scripts/benchmark.sh -r 5 -n 256            # 5 reps, 256 generated tokens
 ./scripts/benchmark.sh --json results.json    # machine-readable output
+./scripts/benchmark.sh --base http://jetson.local:8080   # measure another host
 
 ./scripts/test-detect-platform.sh             # platform detection self-test
+./scripts/test-benchmark.sh                   # benchmark self-test
 ./scripts/test-detect-platform.sh -v          # ... printing every assertion
 ```
 
@@ -82,6 +84,13 @@ docker compose up -d
 merge, model sizing, disk hygiene, container health, full GPU layer offload, the
 OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
 rejects clients which do not trust the CA).
+
+`benchmark.sh` drives the deployed HTTP endpoint rather than `llama-bench`, so
+the numbers reflect the stack as a client sees it. It reports prompt-eval
+throughput (compute bound), generation throughput (memory-bandwidth bound) and
+time to first token, with prompt caching disabled so the prompt-eval figure is
+real. It exits non-zero unless every case produced an actual measurement, so it
+is usable as a gate and not only as something to read.
 
 ### Platform detection self-test
 
@@ -106,6 +115,25 @@ board is never given a smaller model than a smaller one.
 
 `validate.sh` runs it as part of preflight, so a normal validation run reports
 the cross-platform result alongside the checks for the machine in hand.
+
+### Benchmark self-test
+
+The benchmark is the only thing here that produces a number someone will act on,
+so the failure that matters is not a crash but a plausible-looking table that was
+never a measurement. A healthy Jetson only ever exercises the happy path, which
+is why several of these went unnoticed: a server answering `500` under memory
+pressure, a proxy stripping llama.cpp's per-request `timings` block (every rate
+renders as `0.0`), a typo'd `-r` value producing an empty sweep, and a results
+path that is not writable, which used to print `Wrote <path>` over a shell error
+and discard the run.
+
+`test-benchmark.sh` drives the real script against a stub OpenAI-compatible
+server that produces each of those on demand, with no GPU, model, Docker or
+network. Besides the failure paths it pins the things that make the numbers
+mean anything: that prompt caching stays disabled, that `-r` and `-n` are
+actually honoured, that reported rates are positive, that prompt token counts
+grow across the sweep, and that a bad argument is rejected before any request is
+issued. `validate.sh` runs it as part of preflight.
 
 ## Disk usage
 
@@ -133,12 +161,6 @@ built not to waste it:
 `--prune` deletes partial transfers (`*.incomplete`, `*.gguf.part`) and lists
 the models on disk. Only the one named by `MODEL_FILE` is ever served, so any
 others are safe to delete; `validate.sh` reports how much they hold.
-
-`benchmark.sh` drives the deployed HTTP endpoint rather than `llama-bench`, so
-the numbers reflect the stack as a client sees it. It reports prompt-eval
-throughput (compute bound), generation throughput (memory-bandwidth bound) and
-time to first token, with prompt caching disabled so the prompt-eval figure is
-real.
 
 ## Running on NVIDIA Jetson
 
@@ -334,7 +356,8 @@ rm -rf certs/
 │   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
 │   ├── validate.sh             # End-to-end validation suite
 │   ├── test-detect-platform.sh # Hermetic tests for platform detection
-│   └── benchmark.sh            # Throughput benchmark
+│   ├── benchmark.sh            # Throughput benchmark
+│   └── test-benchmark.sh       # Hermetic tests for the benchmark
 ├── models/                     # GGUF model files (git-ignored)
 │   └── *.gguf
 └── certs/                      # TLS certificates (git-ignored)
