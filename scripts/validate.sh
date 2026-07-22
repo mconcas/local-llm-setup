@@ -90,6 +90,20 @@ preflight() {
     skip "no GPU memory budget (CPU-only host)"
   fi
 
+  # Detection takes exactly one branch on any given host, so this machine can
+  # never exercise the other boards' paths. The self-test drives the same script
+  # against synthetic /proc and /etc trees and covers all of them.
+  local selftest
+  if selftest="$(bash "$SCRIPT_DIR/test-detect-platform.sh" 2>&1)"; then
+    ok "platform detection self-test ($(grep -oE '[0-9]+ passed' <<<"$selftest" | tail -1))"
+  else
+    local nfail first
+    nfail="$(grep -cE '^ +- ' <<<"$selftest")"
+    first="$(grep -E '^ +- ' <<<"$selftest" | sed -n '1s/^ *- //p')"
+    no "platform detection self-test: ${nfail} assertion(s) failed" \
+       "first: ${first:-see output}; run ./scripts/test-detect-platform.sh for the rest"
+  fi
+
   head "Preflight - tooling"
 
   if command -v docker &>/dev/null; then
@@ -174,12 +188,21 @@ preflight() {
   # A model that does not fit leaves the container in a crash loop with an
   # opaque cudaMalloc failure, so flag it here where the message can be useful.
   if [[ -f "$host_model" && -n "${GPU_MEM_MB:-}" ]] && (( GPU_MEM_MB > 0 )); then
-    local model_mb; model_mb=$(( $(stat -c %s "$host_model") / 1048576 ))
-    if (( model_mb < GPU_MEM_MB )); then
-      ok "model weights (${model_mb} MiB) fit the ${GPU_MEM_MB} MiB budget"
-    else
+    local model_mb model_pct
+    model_mb=$(( $(stat -c %s "$host_model") / 1048576 ))
+    model_pct=$(( model_mb * 100 / GPU_MEM_MB ))
+    if (( model_mb >= GPU_MEM_MB )); then
       no "model weights (${model_mb} MiB) exceed the ${GPU_MEM_MB} MiB budget" \
          "expect an out-of-memory failure at load; try ${REC_MODEL_FILE:-a smaller quant}"
+    elif (( model_pct > 60 )); then
+      # Weights fitting is not enough: the KV cache, the compute buffers and
+      # llama.cpp's scratch space come out of the same budget. A model at this
+      # ratio loads and then dies once a long prompt grows the cache, which is
+      # far harder to diagnose than a failure at load.
+      skip "model weights take ${model_pct}% of the ${GPU_MEM_MB} MiB budget" \
+           "little room left for a ${CTX_SIZE:-?}-token KV cache; lower CTX_SIZE or use ${REC_MODEL_FILE:-a smaller quant}"
+    else
+      ok "model weights (${model_mb} MiB, ${model_pct}% of budget) leave room for the KV cache"
     fi
   fi
 

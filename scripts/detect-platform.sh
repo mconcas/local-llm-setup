@@ -32,6 +32,18 @@ set -euo pipefail
 EMIT_ENV=0
 [[ "${1:-}" == "--env" ]] && EMIT_ENV=1
 
+# ── Test hooks ────────────────────────────────────────────────────
+# Every hardware probe below goes through these two variables so the detection
+# logic can be exercised against boards that are not the one in hand. Empty
+# defaults mean the real host is inspected, so normal use is unaffected.
+#
+#   PLATFORM_SYSROOT     prefix for /proc, /etc and /var/run probes
+#   PLATFORM_NVIDIA_SMI  binary used for the discrete-GPU probe
+#
+# See scripts/test-detect-platform.sh.
+SYSROOT="${PLATFORM_SYSROOT:-}"
+NVIDIA_SMI="${PLATFORM_NVIDIA_SMI:-nvidia-smi}"
+
 # ── Architecture ──────────────────────────────────────────────────
 PLATFORM_ARCH="$(uname -m)"
 
@@ -41,18 +53,18 @@ PLATFORM_ARCH="$(uname -m)"
 # not enough: some non-Jetson ARM boards also ship Tegra-derived kernels.
 L4T_VERSION=""
 JETSON_MODEL=""
-if [[ -f /etc/nv_tegra_release ]]; then
+if [[ -f "$SYSROOT/etc/nv_tegra_release" ]]; then
   # Format: "# R36 (release), REVISION: 4.7, GCID: ..., BOARD: generic, ..."
-  _major="$(sed -n 's/^# R\([0-9]\+\).*/\1/p' /etc/nv_tegra_release | head -1)"
-  _rev="$(sed -n 's/.*REVISION: \([0-9.]\+\).*/\1/p' /etc/nv_tegra_release | head -1)"
+  _major="$(sed -n 's/^# R\([0-9]\+\).*/\1/p' "$SYSROOT/etc/nv_tegra_release" | head -1)"
+  _rev="$(sed -n 's/.*REVISION: \([0-9.]\+\).*/\1/p' "$SYSROOT/etc/nv_tegra_release" | head -1)"
   [[ -n "$_major" ]] && L4T_VERSION="${_major}.${_rev}"
 fi
-if [[ -r /proc/device-tree/model ]]; then
-  JETSON_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+if [[ -r "$SYSROOT/proc/device-tree/model" ]]; then
+  JETSON_MODEL="$(tr -d '\0' < "$SYSROOT/proc/device-tree/model" 2>/dev/null || true)"
 fi
 
 # ── Memory ────────────────────────────────────────────────────────
-TOTAL_MEM_MB="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)"
+TOTAL_MEM_MB="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' "$SYSROOT/proc/meminfo")"
 
 # ── Classify the platform ─────────────────────────────────────────
 GPU_MEM_MB=0
@@ -71,11 +83,11 @@ if [[ -n "$L4T_VERSION" || "$JETSON_MODEL" == *Jetson* || "$JETSON_MODEL" == *Or
     GPU_MEM_MB=$(( TOTAL_MEM_MB - 1536 ))
   fi
   (( GPU_MEM_MB < 0 )) && GPU_MEM_MB=0
-elif command -v nvidia-smi &>/dev/null &&
-     nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits &>/dev/null; then
+elif command -v "$NVIDIA_SMI" &>/dev/null &&
+     "$NVIDIA_SMI" --query-gpu=memory.total --format=csv,noheader,nounits &>/dev/null; then
   PLATFORM_KIND="nvidia-discrete"
-  PLATFORM_LABEL="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-  GPU_MEM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')"
+  PLATFORM_LABEL="$("$NVIDIA_SMI" --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  GPU_MEM_MB="$("$NVIDIA_SMI" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')"
   # Discrete VRAM is exclusive to the GPU, but the driver, the compositor and
   # llama.cpp's own scratch buffers still need headroom.
   GPU_MEM_MB=$(( GPU_MEM_MB * 90 / 100 ))
@@ -100,8 +112,8 @@ COMPOSE_FILES="docker-compose.yml"
 # actually present.
 have_cdi_spec() {
   local f
-  for f in /etc/cdi/nvidia*.yaml /etc/cdi/nvidia*.json \
-           /var/run/cdi/nvidia*.yaml /var/run/cdi/nvidia*.json; do
+  for f in "$SYSROOT"/etc/cdi/nvidia*.yaml "$SYSROOT"/etc/cdi/nvidia*.json \
+           "$SYSROOT"/var/run/cdi/nvidia*.yaml "$SYSROOT"/var/run/cdi/nvidia*.json; do
     [[ -f "$f" ]] && return 0
   done
   return 1
@@ -169,6 +181,18 @@ else
   REC_MODEL_MB=400; REC_CTX_SIZE=4096; REC_PARALLEL=1; REC_CACHE_TYPE="q8_0"
 fi
 
+# Weights are only part of the footprint: the KV cache, the compute buffers and
+# llama.cpp's own scratch space all come out of the same budget. Express the
+# weights as a share of the budget so both the report below and validate.sh can
+# tell "comfortable" from "will load and then die on the first long prompt".
+# Every tier above is sized to land near 50%; only boards too small for even the
+# 0.5B model exceed that.
+if (( GPU_MEM_MB > 0 )); then
+  REC_MODEL_PCT=$(( REC_MODEL_MB * 100 / GPU_MEM_MB ))
+else
+  REC_MODEL_PCT=0
+fi
+
 # ── Output ────────────────────────────────────────────────────────
 if (( EMIT_ENV )); then
   cat <<EOF
@@ -187,6 +211,7 @@ REC_MODEL_MB=$REC_MODEL_MB
 REC_CTX_SIZE=$REC_CTX_SIZE
 REC_PARALLEL=$REC_PARALLEL
 REC_CACHE_TYPE=$REC_CACHE_TYPE
+REC_MODEL_PCT=$REC_MODEL_PCT
 EOF
   exit 0
 fi
@@ -214,6 +239,14 @@ echo "  File          : $REC_MODEL_FILE (~$((REC_MODEL_MB / 1024)).$(( (REC_MODE
 echo "  Context       : $REC_CTX_SIZE tokens"
 echo "  Parallel      : $REC_PARALLEL slot(s)"
 echo "  KV cache      : $REC_CACHE_TYPE"
+(( GPU_MEM_MB > 0 )) && echo "  Weights use   : ${REC_MODEL_PCT}% of the budget"
+
+if (( GPU_MEM_MB > 0 && REC_MODEL_PCT > 60 )); then
+  echo ""
+  echo "WARNING: even the smallest supported model takes ${REC_MODEL_PCT}% of this board's"
+  echo "         ${GPU_MEM_MB} MiB budget, leaving little for the KV cache. Expect to"
+  echo "         lower CTX_SIZE below $REC_CTX_SIZE, or run this stack on a larger board."
+fi
 
 if [[ "$PLATFORM_KIND" == "jetson" && "$GPU_ACCESS" == "none" ]]; then
   echo ""

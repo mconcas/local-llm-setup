@@ -73,12 +73,39 @@ docker compose up -d
 ./scripts/benchmark.sh                        # throughput sweep
 ./scripts/benchmark.sh -r 5 -n 256            # 5 reps, 256 generated tokens
 ./scripts/benchmark.sh --json results.json    # machine-readable output
+
+./scripts/test-detect-platform.sh             # platform detection self-test
+./scripts/test-detect-platform.sh -v          # ... printing every assertion
 ```
 
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
 merge, model sizing, disk hygiene, container health, full GPU layer offload, the
 OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
 rejects clients which do not trust the CA).
+
+### Platform detection self-test
+
+`detect-platform.sh` decides the container image, the GPU passthrough
+mechanism, the memory budget and the model tier - and on any given host it takes
+exactly one branch. An Orin Nano can never exercise the AGX, discrete-GPU or
+CPU-only paths, so a regression in them would stay invisible until someone ran
+the stack on that board.
+
+`test-detect-platform.sh` closes that gap. It runs the real script against
+synthetic `/proc`, `/etc` and `/var/run` trees (`PLATFORM_SYSROOT`) and a stub
+`nvidia-smi` (`PLATFORM_NVIDIA_SMI`), so every branch is checked on any host
+with no GPU, no Docker and no network. It covers Orin Nano / NX / AGX and Nano
+2 GB and 4 GB, CDI present under `/etc/cdi` and `/var/run/cdi` as well as absent
+or foreign, Jetson identified by device tree alone, discrete cards on x86_64 and
+aarch64, CPU-only hosts, and a host whose `nvidia-smi` exists but fails.
+
+It also sweeps the whole memory range and asserts three invariants that a new or
+resized model tier could break: the recommended weights fit the budget, they
+leave at least 40% of it for the KV cache and compute buffers, and a larger
+board is never given a smaller model than a smaller one.
+
+`validate.sh` runs it as part of preflight, so a normal validation run reports
+the cross-platform result alongside the checks for the machine in hand.
 
 ## Disk usage
 
@@ -306,6 +333,7 @@ rm -rf certs/
 │   ├── gen-certs.sh            # TLS certificate generator
 │   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
 │   ├── validate.sh             # End-to-end validation suite
+│   ├── test-detect-platform.sh # Hermetic tests for platform detection
 │   └── benchmark.sh            # Throughput benchmark
 ├── models/                     # GGUF model files (git-ignored)
 │   └── *.gguf
