@@ -183,6 +183,70 @@ preflight() {
     fi
   fi
 
+  head "Preflight - disk hygiene"
+
+  local model_dir_host="${MODELS_DIR:-./models}"
+
+  # A GGUF starts with the ASCII magic "GGUF". Anything else here is a failed
+  # download wearing a .gguf name - an HTTP error body, an HTML login page or a
+  # truncated transfer - and it fails at load time with an opaque llama.cpp
+  # error rather than an obvious one. Note `head` is a section-header function
+  # in this script, so the binary has to be called explicitly.
+  if [[ -f "$host_model" ]]; then
+    if [[ "$(command head -c 4 "$host_model" 2>/dev/null)" == "GGUF" ]]; then
+      ok "model file has a valid GGUF header"
+    else
+      no "model file is not a valid GGUF (bad magic bytes): $host_model" \
+         "a failed download left this behind; re-fetch it with ./scripts/download-model.sh --recommended"
+    fi
+  fi
+
+  # llama.cpp memory-maps the weights and the OS still needs room for logs and
+  # the page cache, so a models filesystem run to 100% breaks more than loading.
+  local avail_mb
+  avail_mb="$(df -Pk "$model_dir_host" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024}')"
+  if [[ -z "$avail_mb" ]]; then
+    skip "could not determine free space on $model_dir_host"
+  elif (( avail_mb >= 512 )); then
+    ok "models filesystem has $((avail_mb / 1024)) GiB free"
+  else
+    no "only ${avail_mb} MiB free on the models filesystem" \
+       "reclaim space: ./scripts/download-model.sh --prune"
+  fi
+
+  # Interrupted transfers are the main way this stack quietly eats a disk: a
+  # multi-GB partial blob that nothing will ever resume or serve.
+  local partial_mb=0 partial_n=0 f
+  while IFS= read -r -d '' f; do
+    partial_mb=$(( partial_mb + $(stat -c %s "$f" 2>/dev/null || echo 0) / 1048576 ))
+    partial_n=$((partial_n + 1))
+  done < <(find "$model_dir_host" \( -name '*.incomplete' -o -name '*.gguf.part' \) \
+             -type f -print0 2>/dev/null)
+  if (( partial_n == 0 )); then
+    ok "no interrupted downloads left in $model_dir_host"
+  else
+    no "$partial_n interrupted download(s) holding ${partial_mb} MiB" \
+       "reclaim it: ./scripts/download-model.sh --prune"
+  fi
+
+  # Only the GGUF named by MODEL_FILE is ever served. Extra copies are a common
+  # way to lose tens of GB after trying a few quants, so surface them - but as
+  # information, since keeping a spare on purpose is legitimate.
+  local unused_mb=0 unused_n=0 g
+  while IFS= read -r -d '' g; do
+    [[ "$(realpath -m "$g")" == "$(realpath -m "$host_model")" ]] && continue
+    unused_mb=$(( unused_mb + $(stat -c %s "$g" 2>/dev/null || echo 0) / 1048576 ))
+    unused_n=$((unused_n + 1))
+  done < <(find "$model_dir_host" -maxdepth 2 -name '*.gguf' -type f -print0 2>/dev/null)
+  if (( unused_n == 0 )); then
+    ok "no unused model files in $model_dir_host"
+  else
+    skip "$unused_n model file(s) not referenced by MODEL_FILE (${unused_mb} MiB)" \
+         "delete any you no longer need; only $(basename "$host_model") is served"
+  fi
+
+  head "Preflight - TLS"
+
   if [[ -f "$CA_CERT" && -f "$PROJECT_DIR/certs/server.crt" ]]; then
     ok "TLS certificates present"
   else
@@ -213,9 +277,17 @@ runtime() {
 
   head "Runtime - GPU offload"
 
-  local logs; logs="$(dc logs llama-server 2>/dev/null | tail -400)"
+  # The CUDA banner, the ARCHS line and the layer-offload summary are each
+  # printed once, at model load. Searching only the tail of the log made these
+  # checks pass on a freshly started stack and then fail on the same healthy
+  # stack after any real traffic - a single benchmark run is enough to push the
+  # startup banner out of a 400-line window, which then reads as "the model is
+  # running on CPU". Search the whole log, and keep it in a file so a
+  # long-running server's output is never held in a shell variable.
+  local logfile; logfile="$(mktemp)"
+  dc logs llama-server >"$logfile" 2>/dev/null
 
-  if grep -q 'found 1 CUDA devices\|found [0-9]* CUDA devices' <<<"$logs"; then
+  if grep -q 'found [0-9]* CUDA devices' "$logfile"; then
     ok "llama.cpp initialised a CUDA device"
   else
     no "llama.cpp did not report a CUDA device" "the model is running on CPU"
@@ -226,13 +298,13 @@ runtime() {
   # with "the provided PTX was compiled with an unsupported toolchain", so check
   # the compiled architecture list rather than trusting enumeration.
   if [[ "${PLATFORM_KIND:-}" == "jetson" ]]; then
-    if grep -qE 'ARCHS = .*870' <<<"$logs"; then
+    if grep -qE 'ARCHS = .*870' "$logfile"; then
       ok "image contains sm_87 kernels (Orin)"
     else
       no "image does not advertise sm_87 in its CUDA ARCHS" \
          "use ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin"
     fi
-    if grep -q 'unsupported toolchain' <<<"$logs"; then
+    if grep -q 'unsupported toolchain' "$logfile"; then
       no "CUDA PTX JIT failed against the L4T driver" \
          "the image was built with a CUDA toolkit newer than JetPack supports"
     else
@@ -240,7 +312,8 @@ runtime() {
     fi
   fi
 
-  local offl; offl="$(grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' <<<"$logs" | tail -1)"
+  local offl; offl="$(grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' "$logfile" | tail -1)"
+  rm -f "$logfile"
   if [[ -n "$offl" ]]; then
     local n d; n="${offl#offloaded }"; n="${n%%/*}"; d="${offl#*/}"; d="${d%% *}"
     if [[ "$n" == "$d" ]]; then

@@ -44,8 +44,11 @@ git clone <this-repo> && cd local-llm-setup
 #    certs. Pass extra hostnames/IPs for the certificate SANs:
 ./scripts/setup.sh myserver.lan 10.0.0.5
 
-# 3. Download a model. setup.sh prints one sized for this machine; on an
-#    8 GB Jetson Orin Nano that is:
+# 3. Download a model sized for this machine (on an 8 GB Jetson Orin Nano
+#    that is Qwen2.5-3B-Instruct-Q4_K_M, ~1.8 GiB):
+./scripts/download-model.sh --recommended
+
+#    …or name one explicitly:
 ./scripts/download-model.sh \
   bartowski/Qwen2.5-3B-Instruct-GGUF \
   Qwen2.5-3B-Instruct-Q4_K_M.gguf
@@ -73,9 +76,36 @@ docker compose up -d
 ```
 
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
-merge, model sizing, container health, full GPU layer offload, the OpenAI
-endpoints, streaming, tool calling, and the TLS proxy (including that it
+merge, model sizing, disk hygiene, container health, full GPU layer offload, the
+OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
 rejects clients which do not trust the CA).
+
+## Disk usage
+
+Model files are the only large artifact this stack keeps, and a Jetson is
+usually the machine with the least room to spare, so `download-model.sh` is
+built not to waste it:
+
+- **It refuses downloads that would not fit.** The size is probed over HTTP
+  first and compared against real free space on `MODELS_DIR`, keeping a 512 MiB
+  margin. Nothing is transferred when it would not fit.
+- **It never leaves junk named `*.gguf`.** Every download is verified against
+  the GGUF magic bytes and the expected byte count; anything else is deleted.
+  Without this a typo'd filename silently produces a 15-byte file containing
+  `Entry not found`, which `setup.sh` then wires into `.env` and which
+  crash-loops the container with an opaque load error.
+- **It is idempotent.** An already-present, valid model is left alone rather
+  than re-fetched.
+- **It downloads to `MODELS_DIR`**, so pointing that at a data disk works.
+
+```bash
+./scripts/download-model.sh --recommended   # model sized for this machine
+./scripts/download-model.sh --prune         # reclaim interrupted downloads
+```
+
+`--prune` deletes partial transfers (`*.incomplete`, `*.gguf.part`) and lists
+the models on disk. Only the one named by `MODEL_FILE` is ever served, so any
+others are safe to delete; `validate.sh` reports how much they hold.
 
 `benchmark.sh` drives the deployed HTTP endpoint rather than `llama-bench`, so
 the numbers reflect the stack as a client sees it. It reports prompt-eval
@@ -274,7 +304,7 @@ rm -rf certs/
 │   ├── setup.sh                # Bootstrap script
 │   ├── detect-platform.sh      # Hardware detection + tuned defaults
 │   ├── gen-certs.sh            # TLS certificate generator
-│   ├── download-model.sh       # Model downloader (Hugging Face)
+│   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
 │   ├── validate.sh             # End-to-end validation suite
 │   └── benchmark.sh            # Throughput benchmark
 ├── models/                     # GGUF model files (git-ignored)
