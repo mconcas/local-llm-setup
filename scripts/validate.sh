@@ -12,6 +12,11 @@
 #   ./scripts/validate.sh              # preflight + runtime
 #   ./scripts/validate.sh --preflight  # static checks only (no stack needed)
 #   ./scripts/validate.sh --runtime    # assume the stack is already up
+#   ./scripts/validate.sh --base URL   # llama.cpp is reachable elsewhere
+#
+# Environment:
+#   VALIDATE_BASE       same as --base (default http://127.0.0.1:8080)
+#   VALIDATE_SELFTESTS  set to 0 to skip the nested script self-tests
 #
 # Exit status is non-zero if any check fails, so this is usable in CI.
 set -uo pipefail
@@ -21,12 +26,19 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 MODE="all"
-case "${1:-}" in
-  --preflight) MODE="preflight" ;;
-  --runtime)   MODE="runtime" ;;
-  "")          MODE="all" ;;
-  *) echo "Unknown option: $1"; echo "Usage: $0 [--preflight|--runtime]"; exit 2 ;;
-esac
+BASE_URL="${VALIDATE_BASE:-http://127.0.0.1:8080}"
+while (( $# )); do
+  case "$1" in
+    --preflight) MODE="preflight" ;;
+    --runtime)   MODE="runtime" ;;
+    --base|-b)
+      [[ -n "${2:-}" ]] || { echo "--base requires a URL"; exit 2; }
+      BASE_URL="$2"; shift ;;
+    *) echo "Unknown option: $1"
+       echo "Usage: $0 [--preflight|--runtime] [--base URL]"; exit 2 ;;
+  esac
+  shift
+done
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_NAMES=()
@@ -45,10 +57,18 @@ skip() { SKIP=$((SKIP+1)); printf '  %sSKIP%s  %s\n' "$C_SK" "$C_Z" "$1"
 head() { printf '\n%s%s%s\n' "$C_HD" "$1" "$C_Z"; }
 
 # ── Configuration ─────────────────────────────────────────────────
-[[ -f .env ]] && set -a && . ./.env && set +a
+# `set -a; . ./.env` was wrong in both directions: it executes a file that is
+# compose syntax rather than shell, and it keeps whatever compose would have
+# stripped. A CRLF-saved .env produced three failures here, one of which
+# reported "in .env: <image>; expected: <same image>" because the difference was
+# an invisible CR. See lib/env.sh.
+ENV_FILE="$PROJECT_DIR/.env"
+. "$SCRIPT_DIR/lib/env.sh"
+env_load
+
 HTTPS_PORT="${HTTPS_PORT:-8443}"
 CA_CERT="$PROJECT_DIR/certs/ca.crt"
-HTTP_BASE="http://127.0.0.1:8080"
+HTTP_BASE="${BASE_URL%/}"
 HTTPS_BASE="https://localhost:${HTTPS_PORT}"
 
 # detect-platform.sh emits its recommended image as LLAMA_IMAGE - the same name
@@ -83,6 +103,28 @@ for k in sys.argv[1:]:
 print(d if not isinstance(d,(dict,list)) else json.dumps(d))
 " "$@"; }
 
+# Run one script self-test as a check. Each of these drives a real script
+# against synthetic fixtures, covering the paths a healthy host cannot reach.
+#
+# VALIDATE_SELFTESTS=0 turns them off. That exists because test-validate.sh runs
+# *this* script, so leaving them on would recurse; it is not a way to make the
+# suite quieter, and the summary says so when they are skipped.
+selftest() {
+  local script="$1" label="$2" out nfail first
+  if [[ "${VALIDATE_SELFTESTS:-1}" == "0" ]]; then
+    skip "$label self-test (VALIDATE_SELFTESTS=0)"
+    return 0
+  fi
+  if out="$(VALIDATE_SELFTESTS=0 bash "$SCRIPT_DIR/$script" 2>&1)"; then
+    ok "$label self-test ($(grep -oE '[0-9]+ (assertions )?passed' <<<"$out" | tail -1))"
+  else
+    nfail="$(grep -cE '^ +- ' <<<"$out")"
+    first="$(grep -E '^ +- ' <<<"$out" | sed -n '1s/^ *- //p')"
+    no "$label self-test: ${nfail} assertion(s) failed" \
+       "first: ${first:-see output}; run ./scripts/$script for the rest"
+  fi
+}
+
 # ══════════════════════════════════════════════════════════════════
 # Preflight
 # ══════════════════════════════════════════════════════════════════
@@ -104,16 +146,7 @@ preflight() {
   # Detection takes exactly one branch on any given host, so this machine can
   # never exercise the other boards' paths. The self-test drives the same script
   # against synthetic /proc and /etc trees and covers all of them.
-  local selftest
-  if selftest="$(bash "$SCRIPT_DIR/test-detect-platform.sh" 2>&1)"; then
-    ok "platform detection self-test ($(grep -oE '[0-9]+ passed' <<<"$selftest" | tail -1))"
-  else
-    local nfail first
-    nfail="$(grep -cE '^ +- ' <<<"$selftest")"
-    first="$(grep -E '^ +- ' <<<"$selftest" | sed -n '1s/^ *- //p')"
-    no "platform detection self-test: ${nfail} assertion(s) failed" \
-       "first: ${first:-see output}; run ./scripts/test-detect-platform.sh for the rest"
-  fi
+  selftest test-detect-platform.sh "platform detection"
 
   head "Preflight - tooling"
 
@@ -127,6 +160,20 @@ preflight() {
     ok "docker compose present (v$(docker compose version --short 2>/dev/null))"
   else
     no "docker compose v2 not found"
+  fi
+
+  # Every runtime check below speaks HTTP and parses JSON. Without these two the
+  # whole runtime section fails as "the server returned nothing", which points
+  # at the stack rather than at the missing tool.
+  if command -v curl &>/dev/null; then
+    ok "curl present"
+  else
+    no "curl not found" "the runtime checks cannot reach the server without it"
+  fi
+  if command -v python3 &>/dev/null; then
+    ok "python3 present"
+  else
+    no "python3 not found" "needed to parse the server's JSON responses"
   fi
 
   head "Preflight - GPU passthrough"
@@ -197,9 +244,14 @@ preflight() {
   fi
 
   # MODEL_FILE is a container path under /models; map it back to the host.
-  local host_model="${MODELS_DIR:-./models}/${MODEL_FILE##/models/}"
+  # Note the :- default: with MODEL_FILE absent from .env this line used to die
+  # on `set -u` with a raw "unbound variable", which skipped every check after
+  # it - disk hygiene, TLS and all four self-tests - and printed no summary,
+  # while exiting 1 exactly like an ordinary failed check.
+  local mfile="${MODEL_FILE:-}"
+  local host_model="${MODELS_DIR:-./models}/${mfile#/models/}"
   if [[ -z "${MODEL_FILE:-}" ]]; then
-    no "MODEL_FILE is not set in .env"
+    no "MODEL_FILE is not set in .env" "run ./scripts/setup.sh to write one"
   elif [[ "${MODEL_FILE}" != /models/* ]]; then
     no "MODEL_FILE must be a container path starting with /models/ (got: $MODEL_FILE)"
   elif [[ -f "$host_model" ]]; then
@@ -307,16 +359,7 @@ preflight() {
   # pressure, a stripped timings block, a typo'd repetition count, an unwritable
   # results path - are invisible here. The self-test drives the real script
   # against a stub server that produces each of them on demand.
-  local benchtest
-  if benchtest="$(bash "$SCRIPT_DIR/test-benchmark.sh" 2>&1)"; then
-    ok "benchmark self-test ($(grep -oE '[0-9]+ passed' <<<"$benchtest" | tail -1))"
-  else
-    local bfail bfirst
-    bfail="$(grep -cE '^ +- ' <<<"$benchtest")"
-    bfirst="$(grep -E '^ +- ' <<<"$benchtest" | sed -n '1s/^ *- //p')"
-    no "benchmark self-test: ${bfail} assertion(s) failed" \
-       "first: ${bfirst:-see output}; run ./scripts/test-benchmark.sh for the rest"
-  fi
+  selftest test-benchmark.sh "benchmark"
 
   head "Preflight - bootstrap"
 
@@ -324,16 +367,7 @@ preflight() {
   # below. Its risky paths all involve the platform this host is not, or an .env
   # carried over from one. The self-test runs the real script in throwaway
   # project directories against synthetic /proc trees.
-  local setuptest
-  if setuptest="$(bash "$SCRIPT_DIR/test-setup.sh" 2>&1)"; then
-    ok "setup self-test ($(grep -oE '[0-9]+ assertions passed' <<<"$setuptest" | tail -1))"
-  else
-    local sfail sfirst
-    sfail="$(grep -cE '^ +- ' <<<"$setuptest")"
-    sfirst="$(grep -E '^ +- ' <<<"$setuptest" | sed -n '1s/^ *- //p')"
-    no "setup self-test: ${sfail} assertion(s) failed" \
-       "first: ${sfirst:-see output}; run ./scripts/test-setup.sh for the rest"
-  fi
+  selftest test-setup.sh "setup"
 
   head "Preflight - model acquisition"
 
@@ -344,16 +378,17 @@ preflight() {
   # pass on a file the container cannot load. The self-test drives it against a
   # stub Hugging Face endpoint that 404s, gates, lies about sizes and drops
   # connections on demand.
-  local dltest
-  if dltest="$(bash "$SCRIPT_DIR/test-download-model.sh" 2>&1)"; then
-    ok "download self-test ($(grep -oE '[0-9]+ passed' <<<"$dltest" | tail -1))"
-  else
-    local dfail dfirst
-    dfail="$(grep -cE '^ +- ' <<<"$dltest")"
-    dfirst="$(grep -E '^ +- ' <<<"$dltest" | sed -n '1s/^ *- //p')"
-    no "download self-test: ${dfail} assertion(s) failed" \
-       "first: ${dfirst:-see output}; run ./scripts/test-download-model.sh for the rest"
-  fi
+  selftest test-download-model.sh "download"
+
+  head "Preflight - the suite itself"
+
+  # Every check above reports PASS on this machine, which is exactly what a
+  # check that cannot fail also does. The suite's own self-test drives this
+  # script against fixtures where each condition is genuinely broken - a missing
+  # model, a CRLF .env, a container that is down, a server answering with the
+  # wrong model, an nginx accepting untrusted clients - and asserts that the
+  # matching check goes red and the exit status follows.
+  selftest test-validate.sh "validation suite"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -439,6 +474,19 @@ runtime() {
   loaded="$(curl -sf --max-time 15 "$HTTP_BASE/v1/models" 2>/dev/null | jget models 0 name 2>/dev/null)"
   if [[ -n "$loaded" ]]; then
     ok "GET /v1/models lists '$loaded'"
+    # The running server holds whatever was configured when it started. Editing
+    # MODEL_FILE and forgetting to recreate the container leaves every check
+    # here green against the *old* model - which on a Jetson is how a "the new
+    # quant is no faster" report happens. Compare by basename, since the server
+    # reports the path it was given and .env names it inside the container.
+    if [[ -n "${MODEL_FILE:-}" ]]; then
+      if [[ "$(basename "$loaded")" == "$(basename "$MODEL_FILE")" ]]; then
+        ok "the server is serving the model named by MODEL_FILE"
+      else
+        no "the server is serving $(basename "$loaded"), but MODEL_FILE says $(basename "$MODEL_FILE")" \
+           "recreate the container to pick up the change: docker compose up -d --force-recreate"
+      fi
+    fi
   else
     no "GET /v1/models returned no model"
   fi
@@ -451,11 +499,15 @@ runtime() {
     ok "GET /props reports $slots slot(s), n_ctx=$ctx"
     # PARALLEL used to be passed as LLAMA_ARG_PARALLEL, which llama.cpp ignores.
     # Catch a regression back to that by comparing against the configured value.
-    if [[ -n "${PARALLEL:-}" && "$slots" != "${PARALLEL}" ]]; then
+    # With PARALLEL unset there is nothing to compare against, and reporting a
+    # PASS there is the same vacuous-pass shape this suite exists to catch.
+    if [[ -z "${PARALLEL:-}" ]]; then
+      skip "PARALLEL is not set in .env - cannot verify the slot count"
+    elif [[ "$slots" != "${PARALLEL}" ]]; then
       no "PARALLEL=${PARALLEL} in .env but the server has $slots slots" \
          "the server is not receiving LLAMA_ARG_N_PARALLEL"
     else
-      ok "slot count matches PARALLEL=${PARALLEL:-unset}"
+      ok "slot count matches PARALLEL=${PARALLEL}"
     fi
   else
     no "GET /props did not return slot/context information"
@@ -521,8 +573,9 @@ runtime() {
   elif ! grep -q '^nginx .*Up' <<<"$ps_out"; then
     skip "nginx is not running"
   else
+    local tls_up=0
     if curl -sf --max-time 15 --cacert "$CA_CERT" "$HTTPS_BASE/v1/models" >/dev/null 2>&1; then
-      ok "HTTPS GET /v1/models through nginx"
+      ok "HTTPS GET /v1/models through nginx"; tls_up=1
     else
       no "HTTPS request through nginx failed"
     fi
@@ -540,11 +593,14 @@ runtime() {
       no "HTTPS streaming completion failed"
     fi
 
-    if curl -s --max-time 10 "$HTTPS_BASE/v1/models" 2>&1 | grep -q .; then
-      : # ignore - only checking that an untrusted request is refused below
-    fi
-    if curl -sf --max-time 10 "$HTTPS_BASE/v1/models" >/dev/null 2>&1; then
-      no "HTTPS endpoint accepted a request without the CA - certificate is not being verified"
+    # An endpoint that is simply down also refuses a request without the CA, so
+    # this only means anything once the same request has been shown to succeed
+    # *with* it. Reporting a PASS otherwise would make a dead proxy look secure.
+    if (( ! tls_up )); then
+      skip "cannot check CA enforcement - HTTPS is not answering with the CA either"
+    elif curl -sf --max-time 10 "$HTTPS_BASE/v1/models" >/dev/null 2>&1; then
+      no "HTTPS endpoint accepted a request without the CA - certificate is not being verified" \
+         "either the cert is signed by a CA in the system trust store, or nginx is serving plain HTTP"
     else
       ok "HTTPS endpoint rejects clients that do not trust the CA"
     fi

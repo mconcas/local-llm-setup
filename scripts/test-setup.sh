@@ -157,6 +157,7 @@ new_project() {
   cp "$PROJECT_DIR/.env.example" "$P/"
   cp "$PROJECT_DIR"/docker-compose*.yml "$P/"
   cp "$SCRIPT_DIR"/*.sh "$P/scripts/"
+  cp -r "$SCRIPT_DIR/lib" "$P/scripts/"
   # Pre-seed certs: gen-certs.sh runs openssl, which is neither what these
   # tests are about nor fast enough to repeat ~20 times.
   mkdir -p "$P/certs"

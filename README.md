@@ -69,6 +69,7 @@ docker compose up -d
 ./scripts/validate.sh              # preflight + runtime checks, non-zero exit on failure
 ./scripts/validate.sh --preflight  # config/hardware only, no running stack needed
 ./scripts/validate.sh --runtime    # assume the stack is already up
+./scripts/validate.sh --base http://jetson.local:8080   # validate another host
 
 ./scripts/benchmark.sh                        # throughput sweep
 ./scripts/benchmark.sh -r 5 -n 256            # 5 reps, 256 generated tokens
@@ -79,13 +80,20 @@ docker compose up -d
 ./scripts/test-benchmark.sh                   # benchmark self-test
 ./scripts/test-setup.sh                       # bootstrap self-test
 ./scripts/test-download-model.sh              # model acquisition self-test
+./scripts/test-validate.sh                    # the validation suite's own self-test
 ./scripts/test-detect-platform.sh -v          # ... printing every assertion
 ```
 
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
 merge, model sizing, disk hygiene, container health, full GPU layer offload, the
 OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
-rejects clients which do not trust the CA).
+rejects clients which do not trust the CA). It is **41 checks, all green** on a
+Jetson Orin Nano Super with the stack up.
+
+Every self-test above also runs as a preflight check, so `./scripts/validate.sh`
+alone exercises all of them. `VALIDATE_SELFTESTS=0` skips them when you only
+want the checks about this machine; they are reported as skipped rather than
+silently dropped.
 
 `benchmark.sh` drives the deployed HTTP endpoint rather than `llama-bench`, so
 the numbers reflect the stack as a client sees it. It reports prompt-eval
@@ -195,8 +203,14 @@ built not to waste it:
   printed `already present and valid` and exited 0. When the endpoint is
   unreachable the file is kept but reported as unverified rather than as good.
 - **It downloads to `MODELS_DIR`**, so pointing that at a data disk works.
-  The value is read with compose's own rules, so an inline comment or a `.env`
-  saved with CRLF endings does not become part of the path.
+  The value is read with compose's own rules (`scripts/lib/env.sh`, shared by
+  `setup.sh`, `validate.sh` and `benchmark.sh`), so an inline comment or a
+  `.env` saved with CRLF endings does not become part of the path. `.env` is
+  never `source`d: it is compose syntax, not shell, so sourcing it both executes
+  what it should only read - a `$(...)` in a value is a command - and keeps the
+  CR that compose would strip. A CRLF-saved `.env` used to produce three
+  failures in `validate.sh` at once, the clearest of which read
+  `in .env: <image>; expected: <the same image>`.
 
 ```bash
 ./scripts/download-model.sh --recommended   # model sized for this machine
@@ -226,6 +240,29 @@ free-space refusal, `--prune`, `--recommended` against a synthetic Jetson,
 `MODELS_DIR` in every form a `.env` may legally carry it, the argument errors,
 and the `huggingface-cli` path - which is a separate transfer path that must be
 verified the same way. `validate.sh` runs it as part of preflight.
+
+### The validation suite's own self-test
+
+"41/41 green" is only worth something if a red condition actually turns a check
+red. On healthy hardware every check reports PASS - which is also exactly what a
+check that *cannot* fail reports, and two of them could not: the "rejects
+clients that do not trust the CA" check passed against an nginx that was down
+(an endpoint that is off refuses everyone), and the slot-count check passed with
+`PARALLEL` unset. A third crashed the whole run on `set -u` before the summary.
+
+`test-validate.sh` drives the real `validate.sh` in throwaway project
+directories where each condition is genuinely broken - no model, a truncated
+one, a CRLF-saved `.env`, a stopped container, a CPU-only log, an image without
+sm_87, a server still holding the previous model, a proxy that does not enforce
+its CA - and asserts both that the matching check goes red and that its
+neighbours stay green. `docker` is a stub reading canned `config`/`ps`/`logs`
+output, and the llama.cpp API is a small HTTP/HTTPS server with a real
+certificate, so nothing needs a GPU, Docker, a model or the network.
+
+Two hooks make this possible and are useful in their own right: `--base URL`
+points the runtime checks at a llama.cpp reachable elsewhere, and
+`VALIDATE_SELFTESTS=0` stops the nested self-tests (without it, the suite
+testing `validate.sh` would recurse into itself).
 
 ## Running on NVIDIA Jetson
 
@@ -415,6 +452,8 @@ rm -rf certs/
 │   └── nginx.conf              # TLS reverse proxy config
 ├── docker-compose.jetson.yml   # Jetson overlay (CDI GPU passthrough)
 ├── scripts/
+│   ├── lib/
+│   │   └── env.sh              # Reading .env with compose's semantics
 │   ├── setup.sh                # Bootstrap + .env/platform consistency check
 │   ├── test-setup.sh           # Hermetic tests for the bootstrap
 │   ├── detect-platform.sh      # Hardware detection + tuned defaults
@@ -422,6 +461,7 @@ rm -rf certs/
 │   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
 │   ├── test-download-model.sh  # Hermetic tests for the downloader
 │   ├── validate.sh             # End-to-end validation suite
+│   ├── test-validate.sh        # Hermetic tests for the validation suite
 │   ├── test-detect-platform.sh # Hermetic tests for platform detection
 │   ├── benchmark.sh            # Throughput benchmark
 │   └── test-benchmark.sh       # Hermetic tests for the benchmark

@@ -192,6 +192,7 @@ new_project() {
   PROJ_N=$((PROJ_N + 1))
   PROJ="$TMPROOT/proj$PROJ_N"
   mkdir -p "$PROJ/scripts"
+  ln -sf "$SCRIPT_DIR/lib" "$PROJ/scripts/lib"
   ln -sf "$SCRIPT_DIR/download-model.sh" "$PROJ/scripts/download-model.sh"
   ln -sf "$SCRIPT_DIR/detect-platform.sh" "$PROJ/scripts/detect-platform.sh"
 }

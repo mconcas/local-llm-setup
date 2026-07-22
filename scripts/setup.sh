@@ -18,25 +18,11 @@ echo "║       llama.cpp Local Server — Setup             ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
-# Read one key out of .env. Deliberately not `source`: .env is compose syntax,
-# not shell, so a value containing spaces or a `--flag` aborts sourcing halfway
-# and leaves later keys silently unset. Last uncommented assignment wins, which
-# is what compose itself does - as does ending an unquoted value at the first
-# whitespace-preceded '#', and tolerating a file saved with CRLF endings.
-env_get() {
-  local key="$1" val
-  [[ -f .env ]] || return 0
-  val="$(grep -E "^[[:space:]]*${key}=" .env | tail -1)" || return 0
-  val="${val#*=}"
-  val="${val%$'\r'}"
-  if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
-    val="${val:1:${#val}-2}"
-  else
-    val="${val%%[[:space:]]#*}"
-    val="${val%"${val##*[![:space:]]}"}"
-  fi
-  printf '%s' "$val"
-}
+# .env is compose syntax, not shell - see lib/env.sh for why reading it needs
+# more care than `source` or a sed. Shared with download-model.sh and
+# validate.sh so all three resolve a value the way compose does.
+ENV_FILE="$PROJECT_DIR/.env"
+. "$SCRIPT_DIR/lib/env.sh"
 
 MISMATCHES=0
 mismatch() {

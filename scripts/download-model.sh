@@ -36,27 +36,11 @@ HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 HF_ENDPOINT="${HF_ENDPOINT%/}"
 export HF_ENDPOINT
 
-# Read one key out of .env with compose's semantics: the last uncommented
-# assignment wins, surrounding quotes come off, and an unquoted value ends at
-# the first whitespace-preceded '#'. Deliberately not `source` and deliberately
-# not a bare `sed 's/^KEY=//'`: .env is compose syntax, so both a documented
-# inline comment and a file saved with CRLF line endings otherwise end up
-# *inside* the value, and a path is the one setting where that is invisible
-# until several GB have landed in a directory nothing reads.
-env_get() {
-  local key="$1" val
-  [[ -f "$PROJECT_DIR/.env" ]] || return 0
-  val="$(grep -E "^[[:space:]]*${key}=" "$PROJECT_DIR/.env" | tail -1)" || return 0
-  val="${val#*=}"
-  val="${val%$'\r'}"
-  if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
-    val="${val:1:${#val}-2}"
-  else
-    val="${val%%[[:space:]]#*}"
-    val="${val%"${val##*[![:space:]]}"}"
-  fi
-  printf '%s' "$val"
-}
+# .env is compose syntax, not shell - see lib/env.sh for why reading it needs
+# more care than `source` or a sed. A path is the one setting where getting it
+# wrong is invisible until several GB have landed in a directory nothing reads.
+ENV_FILE="$PROJECT_DIR/.env"
+. "$SCRIPT_DIR/lib/env.sh"
 
 # ── Destination ────────────────────────────────────────────────
 # docker-compose.yml bind-mounts ${MODELS_DIR:-./models} at /models, and both

@@ -60,7 +60,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -f .env ]] && set -a && . ./.env && set +a
+# .env is compose syntax, not shell - see lib/env.sh. The results table prints
+# CTX_SIZE and CACHE_TYPE_*, so a value mangled here is reported as the
+# configuration a measurement was taken under.
+ENV_FILE="$PROJECT_DIR/.env"
+. "$SCRIPT_DIR/lib/env.sh"
+env_load
 
 eval "$(bash "$SCRIPT_DIR/detect-platform.sh" --env 2>/dev/null)" || true
 
