@@ -654,9 +654,9 @@ that *responds*, so the suite used to accept "the reply is not empty" as proof
 that inference worked - a reply of `!!!!!!!!` reported `PASS`.
 
 The `Runtime - output correctness` section asks for a number instead. It sends
-one greedy step (`/completion`, `temperature: 0`, `n_probs: 5`,
-`cache_prompt: false`) on a prompt that is four repetitions of a three-word
-cycle:
+one greedy generation (`/completion`, `n_predict: 4`, `temperature: 0`,
+`n_probs: 5`, `cache_prompt: false`) on a prompt that is four repetitions of a
+three-word cycle:
 
 ```
 apple banana cherry apple banana cherry apple banana cherry apple banana
@@ -664,24 +664,35 @@ apple banana cherry apple banana cherry apple banana cherry apple banana
 
 Continuing it needs no world knowledge and no instruction tuning - only that the
 model can attend to its own context - so the assertion is not pinned to one
-model's opinions. Four things are then checked:
+model's opinions. Four tokens rather than one, because `cherry` is a single
+token only on vocabularies that happen to hold it - a 32k-vocab Llama-2
+tokenizer spells it ` cher` + `ry` - so the continuation is judged on the text
+those tokens assemble into rather than on one model's token boundaries. Four
+things are then checked:
 
 | Check | Goes red when | What that means |
 |---|---|---|
 | the token distribution is well formed | a log-probability is not a finite number `<= 0`, the alternatives are not ranked, or greedy decoding did not emit the argmax | the arithmetic behind the answer is broken, not the model - `NaN` in the logits is what a kernel built for the wrong architecture produces once it runs at all |
 | the next token carries N% of the probability mass | the top token is under 25% | the model is not concentrating anywhere. Corrupted weights or a truncated quant flatten the distribution while leaving its structure perfect |
-| the greedy continuation completes the repeated pattern | the answer is not `cherry` | confident and wrong: the model is not attending to its own context |
-| the same request twice gives the same token and log-probability | the two calls disagree | greedy decoding over an uncached prompt is deterministic, so divergence is memory being corrupted mid-run |
+| the greedy continuation completes the repeated pattern | what the four tokens assembled into is neither `cherry` nor a prefix of it at least two characters long | confident and wrong: the model is not attending to its own context |
+| the same request twice gives the same token and log-probability | the two calls emit different tokens, their log-probabilities differ by more than 0.002 nats, or one call reports a finite number and the other does not | greedy decoding over an uncached prompt repeats to within reduction-order noise, so a wider gap is memory being corrupted mid-run, or a kernel that is wrong only on some calls |
 
 On the Orin Nano Super with the recommended 3B, the answer is `cherry` carrying
 **93%** of the mass, and two calls agree to the last digit of that
 log-probability three runs in a row. The 25% floor sits far from both ends of
 it: a uniform distribution over Qwen2.5's 150k-token vocabulary is 0.0007% per
-token.
+token. The 0.002-nat tolerance on that agreement exists because llama.cpp
+assigns a slot per request and `.env.example` ships `PARALLEL=4`: a different
+slot or batch shape reorders the floating-point reduction on CUDA without
+anything being wrong. It is three orders of magnitude below the drift that
+separates one computation from another.
 
 A build that reports no `completion_probabilities`, or a `--base` pointing at a
 proxy with no `/completion`, produces four **skips with the reason stated** -
-not four passes.
+not four passes. Determinism is likewise skipped rather than passed when
+*both* calls report a log-probability that is not a number: the first check is
+already red for that, and comparing two figures neither call could produce
+would be agreement by construction.
 
 The chat reply itself is now checked as text as well: a reply containing C0
 control bytes, invalid UTF-8, or a run of a single repeated character goes red
@@ -709,11 +720,14 @@ certificate, so nothing needs a GPU, Docker, a model or the network.
 
 The output-correctness checks are stubbed the same way, because a healthy board
 cannot reach any of their failure states: the stub serves `NaN` and `null`
-log-probabilities, a log-probability above zero, an unranked alternative list, a
-greedy step that does not emit the argmax, five alternatives within a whisker of
-each other, a confident answer to the wrong pattern, a server whose second call
-disagrees with its first, one that reports no probabilities at all, and a chat
-reply of `!!!!!!!!`. All 217 assertions are hermetic.
+log-probabilities (on both calls, and on only the second of two identical ones),
+a log-probability above zero, an unranked alternative list, a greedy step that
+does not emit the argmax, five alternatives within a whisker of each other, a
+confident answer to the wrong pattern, a subword spelling of the right one, a
+token carrying a newline, a server whose second call disagrees with its first,
+one whose second call differs only by reduction-order noise, one that reports no
+probabilities at all, a `null` chat content, and a chat reply of `!!!!!!!!`. All
+238 assertions are hermetic.
 
 Two hooks make this possible and are useful in their own right: `--base URL`
 points the runtime checks at a llama.cpp reachable elsewhere, and
@@ -1066,9 +1080,11 @@ is not readable output:**
   `./scripts/download-model.sh --recommended` verifies the byte count against
   the remote rather than trusting a valid-looking header.
 - A `the same request twice gave different results` failure is neither: greedy
-  decoding over an uncached prompt is deterministic, so memory is being
-  corrupted while the run is in flight. Check `dmesg` for EDAC or OOM entries
-  and re-run `./scripts/benchmark.sh`, which reports thermal throttling.
+  decoding over an uncached prompt repeats to within reduction-order noise, so a
+  wider gap - or a log-probability that is a number on one call and not on the
+  other - means memory is being corrupted while the run is in flight, or that
+  the kernels are wrong on only some calls. Check `dmesg` for EDAC or OOM
+  entries and re-run `./scripts/benchmark.sh`, which reports thermal throttling.
 
 **Jetson: `cudaMalloc failed: out of memory` while loading:**
 - Unified memory is exhausted. Lower `CTX_SIZE`, set `PARALLEL=1`, set
