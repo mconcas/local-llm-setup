@@ -334,8 +334,41 @@ the download proceeds: a host with no GPU budget, a model whose metadata is not
 in the fetched prefix, an endpoint that does not honour `Range`, or an
 architecture (sliding-window, MLA) whose cache this arithmetic overestimates -
 an upper bound cannot prove a model does *not* fit, so it is never refused on
-one. Sharded `--include` downloads say the check did not run rather than let
-their silence read as a pass.
+one.
+
+#### Sharded models
+
+A `--include` pull is the largest thing this script can be asked to do, and it
+used to be the only one that started without knowing how big it was: shard sizes
+were knowable only to `huggingface-cli`, so a repo larger than the disk
+transferred until the filesystem filled. The repo's file list
+(`/api/models/<repo>/tree/main`) carries every file's real LFS size, so both
+preflights apply to the set:
+
+```
+==> Downloading from unsloth/Qwen3-30B-A3B-GGUF (pattern: BF16/*) …
+      46.3 GiB  BF16/Qwen3-30B-A3B-BF16-00001-of-00002.gguf
+      10.6 GiB  BF16/Qwen3-30B-A3B-BF16-00002-of-00002.gguf
+    2 file(s) matched
+    Download size : 56.9 GiB
+    Free on disk  : 1697.3 GiB
+    Memory budget : 5571 MiB (NVIDIA Jetson Orin Nano … Super)
+    Once loaded   : weights 58265 + 16384-token q8_0/q8_0 KV cache 816 = 59081 MiB (1060%)
+
+Error: this model will not fit on NVIDIA Jetson Orin Nano … Super.
+  …
+  Nothing was downloaded. Re-run with --no-fit-check to fetch it anyway.
+```
+
+The disk check totals every matched file; the memory check totals the `*.gguf`
+ones (an `imatrix.dat` costs disk, not VRAM) and reads the geometry from the
+first shard, since a split GGUF keeps the whole model's metadata there. Patterns
+are matched with the same `fnmatch` rule `huggingface_hub` applies to
+`allow_patterns` - including that `*` crosses `/` and a trailing `/` means the
+directory's contents - so what is totalled is the set that would be transferred.
+A pattern matching nothing is exit 2 with the repo's URL, not the empty success
+it used to be. If the listing cannot be read the download proceeds, saying which
+guarantee is missing rather than letting silence read as a pass.
 
 `HF_ENDPOINT` points both download paths at a Hugging Face mirror or an internal
 proxy; `huggingface_hub` honours the same variable.
@@ -367,6 +400,15 @@ ignores `Range` - which is the one that matters most, because a probe answered
 with the whole object would download the very model it exists to avoid. That
 the refusal happens before the body moves is asserted on the wire, from the
 stub's request log, rather than inferred from an empty directory.
+
+The sharded path is covered by the same stub, which also answers the tree API:
+a set whose shards total past the budget while any one of them fits (the
+differential that proves the *total* is judged, not the object the header came
+from), a petabyte of shards refused on disk, a pattern matching nothing, a
+pattern reaching a nested path the way `fnmatch` does, a listing split across
+`Link`-header pages, and an API that 404s or answers HTML where JSON was
+expected. "Nothing was downloaded" is asserted on `huggingface-cli` never being
+invoked, not on an empty directory - a CLI that ran and failed leaves one too.
 
 ### Deployment configuration self-test
 

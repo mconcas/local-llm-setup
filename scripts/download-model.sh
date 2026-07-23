@@ -34,6 +34,11 @@
 # A model that cannot be served is the "useless model file" this script exists
 # to keep off the disk, and refusing it costs a few MiB instead of several GB.
 #
+# A sharded --include pull gets the same two preflights: the repo's file list
+# carries every shard's real size, so the set is totalled against free disk and
+# sized against the board from the first shard's metadata before the transfer
+# starts.
+#
 # Exit codes: 0 ok, 1 the download failed, 2 wrong arguments, 3 it will not fit.
 #
 # HF_ENDPOINT overrides the Hugging Face base URL (a mirror, an internal proxy).
@@ -114,6 +119,65 @@ free_bytes() {
   local d="$1"
   while [[ ! -d "$d" && "$d" != "/" ]]; do d="$(dirname "$d")"; done
   df -Pk "$d" 2>/dev/null | awk 'NR==2 {printf "%.0f", $4*1024}'
+}
+
+# hf_tree REPO PATTERN - the repo's files matching PATTERN, one "<bytes>\t<path>"
+# line each. rc=1 with a reason on stderr when the listing cannot be read; rc=0
+# with no output when it was read and nothing matched.
+#
+# Shard sizes used to be knowable only to huggingface-cli, which is why the
+# sharded path had neither of the guarantees the single-file path has: the
+# script could not total a download it had not started, so `--include` on a
+# repo far larger than the disk transferred until the filesystem filled. The
+# tree API answers exactly that question - every file with its real LFS size -
+# before a byte of any body moves.
+#
+# The pattern is matched with Python's fnmatch because that is what
+# huggingface_hub's filter_repo_objects uses for allow_patterns, including its
+# rule that a trailing "/" means the directory's contents. Whatever this totals
+# has to be the same set the CLI then transfers, or the preflight is sizing a
+# different download than the one that happens.
+hf_tree() {
+  local repo="$1" pat="$2"
+  command -v python3 >/dev/null 2>&1 || {
+    printf 'python3 is needed to read the repository listing' >&2; return 1; }
+  local url="$HF_ENDPOINT/api/models/$repo/tree/main?recursive=true"
+  local page=0 body hdrs matched out=""
+  while [[ -n "$url" ]] && (( page < 50 )); do
+    page=$((page + 1))
+    hdrs="$(mktemp)"
+    if ! body="$(curl -sfL --max-time 60 -D "$hdrs" "$url" 2>/dev/null)"; then
+      rm -f "$hdrs"
+      printf 'the file list for %s could not be fetched' "$repo" >&2
+      return 1
+    fi
+    if ! matched="$(printf '%s' "$body" | python3 -c '
+import json, sys, fnmatch
+pat = sys.argv[1]
+if pat.endswith("/"):
+    pat += "*"
+for e in json.load(sys.stdin):
+    if e.get("type") != "file":
+        continue
+    p = e.get("path", "")
+    if not fnmatch.fnmatch(p, pat):
+        continue
+    lfs = e.get("lfs") or {}
+    # An LFS pointer is a few hundred bytes; lfs.size is the object behind it.
+    print("%d\t%s" % (int(lfs.get("size") or e.get("size") or 0), p))
+' "$pat" 2>/dev/null)"; then
+      rm -f "$hdrs"
+      printf 'the file list for %s was not readable JSON' "$repo" >&2
+      return 1
+    fi
+    [[ -n "$matched" ]] && out="${out:+$out$'\n'}$matched"
+    # The API pages with a Link header; a repo with hundreds of quants needs it.
+    url="$(grep -i '^link:' "$hdrs" |
+           sed -n 's/.*<\([^>]*\)>[[:space:]]*;[[:space:]]*rel="next".*/\1/p' | tail -1)"
+    rm -f "$hdrs"
+  done
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  return 0
 }
 
 # Remote size of a Hugging Face file, in bytes, without downloading it.
@@ -472,13 +536,58 @@ if [[ "$1" == "--include" ]]; then
 
   echo "==> Downloading from $REPO (pattern: $PATTERN) …"
   echo "    Destination: $MODEL_DIR/"
-  # Shard sizes are only known to the CLI, so report headroom rather than
-  # gating on a total this script cannot compute. The fit check needs a single
-  # object's size and URL for the same reason, so it does not run here either -
-  # say so rather than let its silence read as a pass.
-  echo "    Free on disk: $(human "$(free_bytes "$MODEL_DIR")")"
-  echo "    Fit check   : not available for sharded models - run"
-  echo "                  ./scripts/validate.sh once MODEL_FILE points at the first shard."
+
+  # Size the set before the CLI starts transferring it. A sharded pull is the
+  # largest thing this script can be asked to do and was, until now, the only
+  # one that started without knowing how big it was.
+  TREE_ERR="$(mktemp)"
+  TREE=""; TREE_RC=0
+  TREE="$(hf_tree "$REPO" "$PATTERN" 2>"$TREE_ERR")" || TREE_RC=$?
+
+  if (( TREE_RC == 0 )) && [[ -z "$TREE" ]]; then
+    # The CLI treats this as a successful transfer of nothing, and the script
+    # used to agree with it: "✔ Model downloaded", exit 0, empty directory.
+    echo "" >&2
+    echo "Error: no file in $REPO matches the pattern '$PATTERN'." >&2
+    echo "  Patterns match the full path, so a quant in a subdirectory needs it:" >&2
+    echo "    --include 'Q4_K_M/*'   not   --include '*.gguf'" >&2
+    echo "  Browse the files at $HF_ENDPOINT/$REPO/tree/main" >&2
+    echo "  Nothing was downloaded." >&2
+    rm -f "$TREE_ERR"
+    exit 2
+  fi
+
+  if (( TREE_RC == 0 )); then
+    SHARD_TOTAL=0; SHARD_COUNT=0; WEIGHT_TOTAL=0; FIRST_REMOTE=""
+    while IFS=$'\t' read -r _sz _path; do
+      [[ -z "$_path" ]] && continue
+      SHARD_TOTAL=$((SHARD_TOTAL + _sz)); SHARD_COUNT=$((SHARD_COUNT + 1))
+      echo "      $(human "$_sz")  $_path"
+      # The fit check sizes the weights, which are the GGUFs; a README or a
+      # tokenizer caught by the pattern costs disk but not memory.
+      [[ "$_path" == *.gguf ]] && WEIGHT_TOTAL=$((WEIGHT_TOTAL + _sz))
+      if [[ -z "$FIRST_REMOTE" && "$_path" == *.gguf ]]; then FIRST_REMOTE="$_path"; fi
+      [[ "$_path" == *00001-of-*.gguf ]] && FIRST_REMOTE="$_path"
+    done <<<"$TREE"
+    echo "    $SHARD_COUNT file(s) matched"
+    check_space "$SHARD_TOTAL" "$MODEL_DIR"
+    if [[ -n "$FIRST_REMOTE" ]]; then
+      # A split GGUF keeps the whole model's metadata in its first shard, so
+      # the same ranged read that sizes a single file sizes the set - against
+      # the set's total weight, not the one shard the header came from.
+      check_fit "$HF_ENDPOINT/${REPO}/resolve/main/${FIRST_REMOTE}" "$WEIGHT_TOTAL"
+    else
+      echo "    Fit check     : skipped (no .gguf among the matched files)"
+    fi
+  else
+    # Say which guarantee is missing and why, rather than letting silence read
+    # as a pass.
+    echo "    Free on disk  : $(human "$(free_bytes "$MODEL_DIR")")"
+    echo "    Download size : unknown - $(cat "$TREE_ERR")"
+    echo "    Fit check     : skipped (the file list could not be read) - run"
+    echo "                    ./scripts/validate.sh once MODEL_FILE points at the first shard."
+  fi
+  rm -f "$TREE_ERR"
   echo ""
 
   "$HF_CLI" download "$REPO" \

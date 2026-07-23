@@ -60,6 +60,7 @@ trap 'stop_stub; rm -rf "$TMPROOT"' EXIT INT TERM
 cat >"$TMPROOT/stub.py" <<'PYEOF'
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 
 MODE, PORTFILE, LOGFILE = sys.argv[1], sys.argv[2], sys.argv[3]
 # Optional: a real GGUF to serve as the body, and a size to advertise for it.
@@ -69,6 +70,11 @@ MODE, PORTFILE, LOGFILE = sys.argv[1], sys.argv[2], sys.argv[3]
 # has no business actually holding.
 BODYFILE = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else ""
 ADV_OVERRIDE = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else 0
+# Optional: a JSON file backing /api/models/<repo>/tree/main - either a list of
+# entries or {"pages": [[...], [...]]} to exercise the Link-header paging a
+# repo with hundreds of quants needs. Absent, the endpoint 404s the listing,
+# which is the "the file list could not be read" branch.
+TREEFILE = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else ""
 
 # A small but structurally honest GGUF: the magic the script checks, then
 # filler. Real weights are gigabytes; nothing here needs to be.
@@ -113,8 +119,35 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _tree(self, head):
+        # The listing the sharded preflight totals. 404 when this run ships no
+        # fixture, so "the API is unreachable" is a state the tests can reach.
+        if not TREEFILE:
+            self._error(404, "Repository not found")
+            return
+        spec = json.load(open(TREEFILE))
+        pages = spec["pages"] if isinstance(spec, dict) else [spec]
+        parts = urlparse(self.path)
+        n = int(parse_qs(parts.query).get("page", ["0"])[0])
+        b = b"<html>gateway timeout</html>" if MODE == "badtree" \
+            else json.dumps(pages[n]).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        if n + 1 < len(pages):
+            # An absolute URL, as huggingface.co emits: curl will not follow a
+            # bare path out of a Link header.
+            self.send_header("Link", '<http://%s%s?recursive=true&page=%d>; rel="next"'
+                             % (self.headers.get("Host", "127.0.0.1"), parts.path, n + 1))
+        self.end_headers()
+        if not head:
+            self.wfile.write(b)
+
     def _dispatch(self, head):
         self._log()
+        if self.path.startswith("/api/models/"):
+            self._tree(head)
+            return
         if MODE == "notfound":
             self._error(404, "Entry not found")
             return
@@ -186,12 +219,12 @@ PYEOF
 STUB_LOG="$TMPROOT/requests.jsonl"
 ENDPOINT=""
 
-# start_stub <mode> [body-file] [advertised-size]
+# start_stub <mode> [body-file] [advertised-size] [tree-json]
 start_stub() {
   stop_stub
   rm -f "$TMPROOT/port" "$STUB_LOG"
   python3 "$TMPROOT/stub.py" "$1" "$TMPROOT/port" "$STUB_LOG" \
-          "${2:-}" "${3:-}" >"$TMPROOT/stub.err" 2>&1 &
+          "${2:-}" "${3:-}" "${4:-}" >"$TMPROOT/stub.err" 2>&1 &
   STUB_PID=$!
   local i
   for i in $(seq 1 100); do
@@ -778,7 +811,10 @@ fit_env() {
 # a header, so "it refused before downloading" has to be asserted on the wire,
 # not inferred from an empty models directory.
 ranged_gets() { grep -c '"range": "bytes=' "$STUB_LOG" 2>/dev/null || true; }
-full_gets()   { grep '"method": "GET"' "$STUB_LOG" 2>/dev/null | grep -c '"range": ""' || true; }
+# The listing is fetched with an ordinary GET, so it has to be excluded here or
+# reading the file list would read as the body transfer this asserts against.
+full_gets()   { grep '"method": "GET"' "$STUB_LOG" 2>/dev/null | grep -v '"path": "/api/' |
+                grep -c '"range": ""' || true; }
 
 case_start "a model too large for the board is refused before the body moves"
 new_project; MODELS="$PROJ/models"
@@ -1020,24 +1056,251 @@ expect_rc 0 "recommended model passes its own fit check"
 expect_out "Memory budget : $FIT_BUDGET MiB"
 expect_out 'Once loaded'
 
-case_start "the sharded path says the fit check did not run"
-new_project; MODELS="$PROJ/models"
-DL_SYSROOT="$FIT_SYSROOT"
-mkdir -p "$PROJ/.venv/bin"
-cat >"$PROJ/.venv/bin/hf" <<EOF
+# ── Sharded pulls get the same two preflights ─────────────────────
+# The largest thing this script can be asked to do was, until now, the only one
+# it started without knowing how big it was: shard sizes were knowable only to
+# huggingface-cli, so `--include` on a repo larger than the disk transferred
+# until the filesystem filled, and a model the board cannot serve was found out
+# about afterwards. The repo's file list carries every shard's real LFS size, so
+# both questions are answerable before the CLI is handed the transfer.
+
+# mk_tree <out> <"bytes:path"...> - a /api/models/<repo>/tree/main listing.
+# The directory entry is deliberate: the real API emits them, and a preflight
+# that totals a directory's size (0) as a file would silently under-count.
+mk_tree() {
+  local out="$1"; shift
+  python3 - "$out" "$@" <<'PY'
+import json, sys
+out, entries = sys.argv[1], [{"type": "directory", "oid": "d0", "path": "Q4_K_M"}]
+for spec in sys.argv[2:]:
+    size, _, path = spec.partition(":")
+    entries.append({"type": "file", "oid": "ab", "size": int(size),
+                    "lfs": {"oid": "cd", "size": int(size), "pointerSize": 134},
+                    "path": path})
+json.dump(entries, open(out, "w"))
+PY
+}
+
+# mk_tree_paged <out> <page1-spec> <page2-spec> - the same listing split across
+# two Link-header pages, which is what a repo carrying every quant returns.
+mk_tree_paged() {
+  local out="$1" a="$2" b="$3"
+  python3 - "$out" "$a" "$b" <<'PY'
+import json, sys
+def entry(spec):
+    size, _, path = spec.partition(":")
+    return {"type": "file", "oid": "ab", "size": int(size),
+            "lfs": {"oid": "cd", "size": int(size)}, "path": path}
+json.dump({"pages": [[entry(sys.argv[2])], [entry(sys.argv[3])]]},
+          open(sys.argv[1], "w"))
+PY
+}
+
+# mk_hf_stub - a huggingface-cli that records that it ran. "Nothing was
+# downloaded" has to be asserted on the CLI never being reached, not on an
+# empty directory: a CLI that ran and failed leaves one too.
+HF_MARKER=""
+mk_hf_stub() {
+  HF_MARKER="$PROJ/hf-ran"
+  mkdir -p "$PROJ/.venv/bin"
+  cat >"$PROJ/.venv/bin/hf" <<EOF
 #!/usr/bin/env bash
 dir=""
 while [[ \$# -gt 0 ]]; do [[ "\$1" == "--local-dir" ]] && dir="\$2"; shift; done
+echo ran >"$HF_MARKER"
 mkdir -p "\$dir/Q4_K_M"
 cp "$FITGGUF" "\$dir/Q4_K_M/shard-00001-of-00002.gguf"
+cp "$FITGGUF" "\$dir/Q4_K_M/shard-00002-of-00002.gguf"
 EOF
-chmod +x "$PROJ/.venv/bin/hf"
-start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+  chmod +x "$PROJ/.venv/bin/hf"
+}
+expect_hf_ran() {
+  if [[ -f "$HF_MARKER" ]]; then pass "the transfer was handed to huggingface-cli"
+  else fail "huggingface-cli was never invoked" "$(tr '\n' '|' <<<"$OUT" | cut -c1-220)"; fi
+}
+expect_hf_not_run() {
+  if [[ ! -f "$HF_MARKER" ]]; then pass "huggingface-cli was never invoked${1:+ ($1)}"
+  else fail "the transfer started anyway${1:+ ($1)}" "$(tr '\n' '|' <<<"$OUT" | cut -c1-220)"; fi
+}
+
+TREE="$TMPROOT/tree.json"
+MIB=1048576
+
+case_start "a sharded pull is totalled and sized before it starts"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree "$TREE" "$((1024 * MIB)):Q4_K_M/shard-00001-of-00002.gguf" \
+                "$((1024 * MIB)):Q4_K_M/shard-00002-of-00002.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
 fit_env 16384
 run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
-expect_rc 0 "sharded download succeeds"
-expect_out 'Fit check.*not available for sharded models'
+expect_rc 0 "a sharded set that fits"
+expect_out '1\.0 GiB  Q4_K_M/shard-00001-of-00002\.gguf'
+expect_out '1\.0 GiB  Q4_K_M/shard-00002-of-00002\.gguf'
+expect_out '2 file\(s\) matched'
+expect_out 'Download size : 2\.0 GiB'
+# The whole point: the shards are summed, not sampled.
+expect_out 'Once loaded   : weights 2048 .*16384-token q8_0/q8_0 KV cache 306 = 2354 MiB'
+expect_out "Memory budget : $FIT_BUDGET MiB"
+expect_not_out 'not available for sharded models'
+expect_hf_ran
+if [[ "$(ranged_gets)" -ge 1 ]]; then pass "the first shard's metadata was read with a ranged request"
+else fail "no ranged request was issued" "$(cat "$STUB_LOG")"; fi
+
+case_start "the fit verdict is the set's total, not the shard the header came from"
+# The differential that proves the total is what is judged: one 3000 MiB shard
+# fits the 5764 MiB budget comfortably, and two of them cannot.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree "$TREE" "$((3000 * MIB)):Q4_K_M/only.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 0 "one 3000 MiB shard fits"
+expect_out 'weights 3000 '
+expect_hf_ran
+
+new_project; MODELS="$PROJ/models"
+mk_hf_stub
+mk_tree "$TREE" "$((3000 * MIB)):Q4_K_M/shard-00001-of-00002.gguf" \
+                "$((3000 * MIB)):Q4_K_M/shard-00002-of-00002.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 3 "two of the same shard do not"
+expect_out 'will not fit'
+expect_out 'weights 6000 '
+expect_out "against a $FIT_BUDGET MiB budget"
+expect_no_gguf "refused sharded set"
+expect_hf_not_run "the board cannot serve it"
+if [[ "$(full_gets)" == 0 ]]; then pass "no unranged GET - the 5.9 GiB of shards never started"
+else fail "a body transfer started despite the refusal" "$(full_gets) unranged GETs"; fi
+
+case_start "a sharded pull the disk cannot hold is refused before it starts"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree "$TREE" "$((1 << 50)):Q4_K_M/huge-00001-of-00002.gguf" \
+                "$((1024 * MIB)):Q4_K_M/huge-00002-of-00002.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 1 "a petabyte of shards"
+expect_out 'not enough free space'
+expect_no_gguf "oversized sharded set"
+expect_hf_not_run "the disk cannot hold it"
+
+case_start "a pattern that matches nothing is an error, not an empty success"
+# It used to print "✔ Model downloaded" over an empty directory and exit 0,
+# because the CLI reports a successful transfer of no files.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree "$TREE" "$((1024 * MIB)):Q8_0/other.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 2 "no match"
+expect_out "no file in acme/Qwen3-GGUF matches the pattern"
+expect_not_out 'Model downloaded'
+expect_hf_not_run "nothing matched"
+
+case_start "patterns match the full path, the way huggingface_hub does"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree "$TREE" "$((1024 * MIB)):Q4_K_M/inside.gguf" \
+                "$((2048 * MIB)):toplevel.gguf" \
+                "$((512 * MIB)):Q4_K_M/nested/deeper.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 0 "prefix pattern"
+expect_out 'Q4_K_M/inside\.gguf'
+expect_not_out 'toplevel\.gguf'
+# fnmatch's "*" crosses "/", which is why huggingface-cli would fetch the
+# nested file too - the total has to agree with what the CLI transfers.
+expect_out 'Q4_K_M/nested/deeper\.gguf'
+expect_out '2 file\(s\) matched'
+expect_out 'Download size : 1\.5 GiB'
+
+new_project; MODELS="$PROJ/models"
+mk_hf_stub
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/'
+expect_rc 0 "a trailing slash means the directory's contents"
+expect_out 'Q4_K_M/inside\.gguf'
+expect_not_out 'toplevel\.gguf'
+
+case_start "matched files that are not weights cost disk but not memory"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree "$TREE" "$((1024 * MIB)):Q4_K_M/model.gguf" \
+                "$((2048 * MIB)):Q4_K_M/imatrix.dat"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 0 "a mixed set"
+expect_out 'Download size : 3\.0 GiB'
+expect_out 'weights 1024 '
+
+case_start "the file list is followed across pages"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree_paged "$TREE" "$((1024 * MIB)):Q4_K_M/shard-00001-of-00002.gguf" \
+                      "$((1024 * MIB)):Q4_K_M/shard-00002-of-00002.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 0 "paged listing"
+expect_out '2 file\(s\) matched'
+expect_out 'Download size : 2\.0 GiB'
+if [[ "$(grep -c '"path": "/api/' "$STUB_LOG")" -ge 2 ]]; then
+  pass "both pages were requested"
+else fail "the next page was never fetched" "$(cat "$STUB_LOG")"; fi
+
+case_start "a listing that cannot be read says so instead of reading as a pass"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"      # no tree fixture: the API 404s
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 0 "an unreadable listing does not block the download"
+expect_out 'Download size : unknown'
+expect_out 'Fit check.*skipped'
 expect_out 'validate.sh'
+expect_hf_ran
+
+new_project; MODELS="$PROJ/models"
+mk_hf_stub
+mk_tree "$TREE" "$((1024 * MIB)):Q4_K_M/model.gguf"
+start_stub badtree "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 0 "an HTML error page where JSON was expected"
+expect_out 'not readable JSON'
+expect_out 'Fit check.*skipped'
+expect_hf_ran
+
+case_start "--no-fit-check still skips the memory check on a sharded pull"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub
+mk_tree "$TREE" "$((6000 * MIB)):Q4_K_M/toobig.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*' --no-fit-check
+expect_rc 0 "the override reaches the sharded path"
+expect_out 'Fit check     : skipped \(--no-fit-check\)'
+# The disk guarantee is not what was overridden, so it still reports.
+expect_out 'Download size : 5\.9 GiB'
+expect_hf_ran
 
 DL_SYSROOT=""; DL_FIT_HEADER=""
 
