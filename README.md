@@ -674,10 +674,10 @@ model's opinions. Four things are then checked:
 | the same request twice gives the same token and log-probability | the two calls disagree | greedy decoding over an uncached prompt is deterministic, so divergence is memory being corrupted mid-run |
 
 On the Orin Nano Super with the recommended 3B, the answer is `cherry` carrying
-**93%** of the mass, and two calls agree to the last digit of the
-log-probability (`-0.4982171654701233` three runs in a row). The 25% floor sits
-far from both ends of that: a uniform distribution over Qwen2.5's 150k-token
-vocabulary is 0.0007% per token.
+**93%** of the mass, and two calls agree to the last digit of that
+log-probability three runs in a row. The 25% floor sits far from both ends of
+it: a uniform distribution over Qwen2.5's 150k-token vocabulary is 0.0007% per
+token.
 
 A build that reports no `completion_probabilities`, or a `--base` pointing at a
 proxy with no `/completion`, produces four **skips with the reason stated** -

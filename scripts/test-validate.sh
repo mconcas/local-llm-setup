@@ -1134,6 +1134,9 @@ run_jetson "$P" --runtime
 assert_fail "$OUT" "not a finite number" "a NaN log-probability is caught"
 assert_contains "$OUT" "GPU_LAYERS=0" "names the way to tell the kernels from the model"
 assert_skip "$OUT" "how peaked the distribution is" "peakedness is skipped, not judged on a NaN"
+# Both calls report the log-probability as 0 because neither could be read, and
+# comparing two of those is agreement by construction.
+assert_skip "$OUT" "cannot judge determinism" "determinism is skipped, not passed on two unread numbers"
 
 # llama.cpp's JSON writer renders a NaN as null rather than as the literal, so
 # the same defect arrives in two spellings and both have to go red.

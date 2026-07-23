@@ -1320,6 +1320,21 @@ expect_rc 1 "the weights never landed"
 expect_out 'did not leave the weights'
 expect_not_out 'Model downloaded'
 
+# The same failure with nothing at all under the pattern's directory: the tree
+# API and `hf download --include` are separate filters and can disagree, so the
+# CLI can exit 0 having created no directory. The searches below it must not
+# take the shell down with them before the diagnostic is printed.
+new_project; MODELS="$PROJ/models"
+mk_hf_stub nothing
+mk_tree "$TREE" "$((1024 * MIB)):Q4_K_M/model.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 1 "the pattern's directory was never created"
+expect_out 'Q4_K_M/model\.gguf was listed in acme/Qwen3-GGUF'
+expect_out 'did not leave the weights'
+expect_not_out 'Model downloaded'
+
 # A slash-free pattern makes the search directory the whole models directory,
 # where a model from an earlier download lives. A listing that was read and
 # named no .gguf settles that this pull asked for no weights, so nothing may be

@@ -623,10 +623,14 @@ if [[ "$1" == "--include" ]]; then
   if [[ -n "$FIRST_REMOTE" && -f "$MODEL_DIR/$FIRST_REMOTE" ]]; then
     TARGET="$MODEL_DIR/$FIRST_REMOTE"
   elif [[ -n "$FIRST_REMOTE" ]] || (( TREE_RC != 0 )); then
+    # `|| true` because a missing SEARCH_DIR is one of the cases being diagnosed
+    # below: find exits 1, pipefail carries that out of the substitution, and
+    # errexit would abort here with no output instead of naming the weights that
+    # were listed and never arrived.
     FIRST_SHARD=$(find "$SEARCH_DIR" ${DEPTH[@]+"${DEPTH[@]}"} \
-                       -name '*00001-of-*.gguf' 2>/dev/null | head -1)
+                       -name '*00001-of-*.gguf' 2>/dev/null | head -1) || true
     SINGLE_FILE=$(find "$SEARCH_DIR" ${DEPTH[@]+"${DEPTH[@]}"} \
-                       -name '*.gguf' ! -name '*-of-*' 2>/dev/null | head -1)
+                       -name '*.gguf' ! -name '*-of-*' 2>/dev/null | head -1) || true
     TARGET="${FIRST_SHARD:-$SINGLE_FILE}"
   fi
 

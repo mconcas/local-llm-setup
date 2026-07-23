@@ -202,7 +202,10 @@ out = [
     "PROBE_ORDERED=%d" % ordered,
     "PROBE_ARGMAX=%d" % (emitted == top),
     "PROBE_ALTS=%d" % len(tops),
-    "PROBE_TOP_PCT=%d" % (round(math.exp(vals[0]) * 100) if finite else 0),
+    # max(), not vals[0]: an unranked list is its own check, and reading the
+    # peakedness off whatever happened to be first would report a second red
+    # with an understated mass for that one defect.
+    "PROBE_TOP_PCT=%d" % (round(math.exp(max(vals)) * 100) if finite else 0),
     # Micro-units, so the determinism comparison is integer equality in bash
     # rather than a float compare that would need a tolerance nothing measured.
     "PROBE_LOGPROB_U=%d" % (round(emitted_lp * 1000000) if finite else 0),
@@ -1101,11 +1104,16 @@ runtime() {
          "the prompt repeats one three-word cycle four times, so this needs attention over the context and nothing else"
     fi
 
-    local u1="$PROBE_LOGPROB_U" t1="$PROBE_EMITTED" du
+    local u1="$PROBE_LOGPROB_U" t1="$PROBE_EMITTED" f1="$PROBE_FINITE" du
     if probe2="$(probe_run 2>&1)" && grep -q '^PROBE_FINITE=' <<<"$probe2"; then
       probe_load "$probe2"
       du=$(( PROBE_LOGPROB_U - u1 )); (( du < 0 )) && du=$(( -du ))
-      if [[ "$PROBE_EMITTED" == "$t1" ]] && (( du <= PROBE_LOGPROB_TOL_U )); then
+      if (( ! f1 )) || (( ! PROBE_FINITE )); then
+        # PROBE_LOGPROB_U is 0 whenever the probe could not read a number, so a
+        # server returning NaN on both calls compares two fabricated zeros and
+        # reports agreement. That is a check that cannot fail, not a pass.
+        skip "cannot judge determinism - the log-probabilities are not numbers"
+      elif [[ "$PROBE_EMITTED" == "$t1" ]] && (( du <= PROBE_LOGPROB_TOL_U )); then
         ok "the same request twice gives the same token and the same log-probability (within ${PROBE_LOGPROB_TOL_U}e-6)"
       else
         no "the same request twice gave different results" \
