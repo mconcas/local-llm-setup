@@ -110,6 +110,10 @@ for k in sys.argv[1:]:
     else:
         if not isinstance(d,dict) or k not in d: sys.exit(1)
         d=d[k]
+# A JSON null is a field the server declined to fill, not a value. Printing it
+# would hand the caller the string 'None', which is non-empty and reads as a
+# working answer everywhere a reply is tested for emptiness.
+if d is None: sys.exit(1)
 print(d if not isinstance(d,(dict,list)) else json.dumps(d))
 " "$@"; }
 
@@ -129,6 +133,18 @@ print(d if not isinstance(d,(dict,list)) else json.dumps(d))
 PROBE_PROMPT='apple banana cherry apple banana cherry apple banana cherry apple banana'
 PROBE_EXPECT='cherry'
 PROBE_MIN_PCT=25
+# Four tokens rather than one: " cherry" is a single token only on vocabularies
+# that happen to hold it, and a 32k-vocab Llama-2 tokenizer splits it into
+# " cher" + "ry". Assembling a few tokens lets the continuation be judged on the
+# text every tokenizer agrees on instead of on one model's token boundaries.
+PROBE_PREDICT=4
+# Micro-units of log-probability the two determinism probes may differ by. Exact
+# equality is what a single code path gives, but llama.cpp assigns a slot per
+# request and .env.example ships PARALLEL=4: a different slot or batch shape
+# reorders the floating-point reduction on CUDA without anything being wrong.
+# 2000 = 0.002 nats, three orders of magnitude below the 0.5-nat drift that
+# separates "the same computation" from "a different one".
+PROBE_LOGPROB_TOL_U=2000
 
 # probe_run - POST the probe to /completion and print eval-safe PROBE_* fields.
 # Returns 1 having printed the reason when the response cannot be read as a token
@@ -138,7 +154,7 @@ probe_run() {
   local body
   body="$(curl -sf --max-time 120 "$HTTP_BASE/completion" \
     -H 'Content-Type: application/json' \
-    -d "{\"prompt\":\"${PROBE_PROMPT}\",\"n_predict\":1,\"temperature\":0,
+    -d "{\"prompt\":\"${PROBE_PROMPT}\",\"n_predict\":${PROBE_PREDICT},\"temperature\":0,
          \"n_probs\":5,\"cache_prompt\":false}" 2>/dev/null)" \
     || { echo "/completion did not answer"; return 1; }
   python3 -c '
@@ -184,10 +200,29 @@ out = [
     "PROBE_LOGPROB_U=%d" % (round(emitted_lp * 1000000) if finite else 0),
     "PROBE_EMITTED=%s" % shlex.quote(emitted.strip()),
     "PROBE_TOP=%s" % shlex.quote(top.strip()),
+    # Unstripped, for the argmax failure message: a mismatch that is leading
+    # whitespace only - a plausible detokenisation defect - reads as "emitted
+    # 'cherry', but the top alternative is 'cherry'" once both are stripped.
+    "PROBE_EMITTED_RAW=%s" % shlex.quote(emitted),
+    "PROBE_TOP_RAW=%s" % shlex.quote(top),
     "PROBE_CONTENT=%s" % shlex.quote(str(d.get("content", "")).strip()),
 ]
 print("\n".join(out))
 ' "$body"
+}
+
+# probe_load <output> - reset the PROBE_* fields, then take only the well-formed
+# assignments out of <output>. The probe is captured with its stderr, so an
+# unexpected traceback still reaches the skip reason - but a stray stderr line
+# makes a bare `eval` a syntax error, which executes none of the assignments and
+# leaves PROBE_FINITE unset. Under `set -u` the next `(( PROBE_FINITE ))` then
+# aborts the whole run with no summary. Defaulting and filtering closes both.
+probe_load() {
+  PROBE_FINITE=0; PROBE_ORDERED=0; PROBE_ARGMAX=0; PROBE_ALTS=0
+  PROBE_TOP_PCT=0; PROBE_LOGPROB_U=0
+  PROBE_EMITTED=''; PROBE_TOP=''; PROBE_CONTENT=''
+  PROBE_EMITTED_RAW=''; PROBE_TOP_RAW=''
+  eval "$(grep -E '^PROBE_[A-Z_]+=' <<<"$1")"
 }
 
 # text_is_readable - stdin is output a human could have read. Rejects the shapes
@@ -1005,8 +1040,13 @@ runtime() {
   # computes, which on a Jetson is the difference between a working offload and
   # one whose kernels are wrong for sm_87.
   local probe1 probe2 probe_reason
+  # Declared here so probe_load assigns into locals rather than leaking the
+  # whole PROBE_* set into the rest of the run.
+  local PROBE_FINITE PROBE_ORDERED PROBE_ARGMAX PROBE_ALTS PROBE_TOP_PCT \
+        PROBE_LOGPROB_U PROBE_EMITTED PROBE_TOP PROBE_CONTENT \
+        PROBE_EMITTED_RAW PROBE_TOP_RAW
   if probe1="$(probe_run 2>&1)" && grep -q '^PROBE_FINITE=' <<<"$probe1"; then
-    eval "$probe1"
+    probe_load "$probe1"
 
     if (( PROBE_FINITE )) && (( PROBE_ORDERED )) && (( PROBE_ARGMAX )); then
       ok "the token distribution is well formed (${PROBE_ALTS} alternatives, ranked, argmax emitted)"
@@ -1019,7 +1059,7 @@ runtime() {
          "top_logprobs must be non-increasing; an unordered list means the sampler saw different logits"
     else
       no "at temperature 0 the emitted token is not the most probable one" \
-         "emitted '${PROBE_EMITTED}', but the top alternative is '${PROBE_TOP}'" \
+         "emitted '${PROBE_EMITTED_RAW}', but the top alternative is '${PROBE_TOP_RAW}'" \
          "greedy decoding that does not pick the argmax means sampling and scoring disagree"
     fi
 
@@ -1033,23 +1073,30 @@ runtime() {
          "check the GGUF against its published checksum and confirm the image carries sm_87 kernels"
     fi
 
-    if [[ "${PROBE_EMITTED,,}" == "${PROBE_EXPECT}"* || "${PROBE_CONTENT,,}" == "${PROBE_EXPECT}"* ]]; then
+    local cont_l="${PROBE_CONTENT,,}" tok_l="${PROBE_EMITTED,,}"
+    if [[ "$cont_l" == "${PROBE_EXPECT}"* || "$tok_l" == "${PROBE_EXPECT}"* ]]; then
       ok "the greedy continuation completes the repeated pattern ('${PROBE_EXPECT}')"
+    elif [[ -n "$tok_l" && "${PROBE_EXPECT}" == "$tok_l"* ]]; then
+      # A vocabulary that has no whole-word " cherry" token emits a subword of
+      # it first. That is the pattern being completed, not a model failing the
+      # probe, so it passes on the prefix rather than on the whole word.
+      ok "the greedy continuation starts the repeated pattern ('${PROBE_EMITTED}' opens '${PROBE_EXPECT}')"
     else
       no "the greedy continuation does not complete the repeated pattern" \
          "expected '${PROBE_EXPECT}', got '${PROBE_EMITTED:-${PROBE_CONTENT}}'" \
          "the prompt repeats one three-word cycle four times, so this needs attention over the context and nothing else"
     fi
 
-    local u1="$PROBE_LOGPROB_U" t1="$PROBE_EMITTED"
+    local u1="$PROBE_LOGPROB_U" t1="$PROBE_EMITTED" du
     if probe2="$(probe_run 2>&1)" && grep -q '^PROBE_FINITE=' <<<"$probe2"; then
-      eval "$probe2"
-      if [[ "$PROBE_EMITTED" == "$t1" && "$PROBE_LOGPROB_U" == "$u1" ]]; then
-        ok "the same request twice gives the same token and the same log-probability"
+      probe_load "$probe2"
+      du=$(( PROBE_LOGPROB_U - u1 )); (( du < 0 )) && du=$(( -du ))
+      if [[ "$PROBE_EMITTED" == "$t1" ]] && (( du <= PROBE_LOGPROB_TOL_U )); then
+        ok "the same request twice gives the same token and the same log-probability (within ${PROBE_LOGPROB_TOL_U}e-6)"
       else
         no "the same request twice gave different results" \
            "first '${t1}' at ${u1}e-6, then '${PROBE_EMITTED}' at ${PROBE_LOGPROB_U}e-6" \
-           "greedy decoding over an uncached prompt is deterministic; divergence means memory is being corrupted mid-run"
+           "greedy decoding over an uncached prompt repeats to within reduction-order noise; a gap this size means memory is being corrupted mid-run"
       fi
     else
       skip "cannot repeat the probe - ${probe2:-/completion stopped answering}"

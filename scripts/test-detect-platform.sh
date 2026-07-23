@@ -128,10 +128,14 @@ run_detect() {
          bash "$TARGET" --env 2>&1)" || {
     echo "    detect-platform.sh --env failed:"; sed 's/^/      /' <<<"$out"; return 1; }
   RES=()
-  local k v
-  while IFS='=' read -r k v; do
-    [[ -z "$k" ]] && continue
-    v="${v%\"}"; v="${v#\"}"
+  local line k v
+  # Unquoted the way the four consumers do it - by eval - rather than by
+  # stripping a pair of double quotes, so the assertions below are made against
+  # the value a caller actually ends up with.
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
+    k="${BASH_REMATCH[1]}"
+    eval "v=${line#*=}"
     RES["$k"]="$v"
   done <<<"$out"
   return 0
@@ -555,6 +559,47 @@ if ( eval "$env_out" ) 2>/dev/null; then
   fi
 else
   fail "--env output is not eval-safe"
+fi
+
+# The label is free text read off the board. Inside double quotes a command
+# substitution in it would have run in setup.sh, validate.sh, benchmark.sh and
+# download-model.sh, all four of which eval this output.
+root="$(fake_root eval-injection 8218000)"
+with_tegra_release "$root" 36 4.7
+with_device_tree_model "$root" 'Orin $(touch '"$root"'/pwned) `touch '"$root"'/pwned2` Super'
+with_cdi_spec "$root" etc
+with_uname "$root" aarch64
+env_out="$(PATH="$root/bin:$PATH" PLATFORM_SYSROOT="$root" \
+           PLATFORM_NVIDIA_SMI=nvidia-smi-absent-in-fixture bash "$TARGET" --env)"
+label="$(eval "$env_out" 2>/dev/null; printf '%s' "${PLATFORM_LABEL:-}")"
+if [[ -e "$root/pwned" || -e "$root/pwned2" ]]; then
+  fail "a device-tree label executes when the --env output is eval'd"
+elif [[ "$label" == 'Orin $(touch '"$root"'/pwned) `touch '"$root"'/pwned2` Super' ]]; then
+  pass "a label carrying \$() and backticks survives eval as literal text"
+else
+  fail "PLATFORM_LABEL round trip with shell metacharacters" "got '$label'"
+fi
+
+# The same contract for the nvpmodel NAME= field, which is read off the board
+# by lib/power.sh and emitted next to it.
+root="$(fake_root eval-injection-power 8218000)"
+with_tegra_release "$root" 36 4.7
+with_device_tree_model "$root" "NVIDIA Jetson Orin Nano Developer Kit Super"
+with_cdi_spec "$root" etc
+with_uname "$root" aarch64
+mkdir -p "$root/etc" "$root/var/lib/nvpmodel"
+# The conf parser splits on whitespace, so the mode name carries none: what is
+# being asserted here is that `$()` and a backtick reach the caller as text.
+printf '< PM_CONFIG DEFAULT=0 >\n< POWER_MODEL ID=0 NAME=15W$(id)`id` >\n' \
+  >"$root/etc/nvpmodel.conf"
+printf 'pmode:0000 fmode:fan_mode_quiet\n' >"$root/var/lib/nvpmodel/status"
+env_out="$(PATH="$root/bin:$PATH" PLATFORM_SYSROOT="$root" \
+           PLATFORM_NVIDIA_SMI=nvidia-smi-absent-in-fixture bash "$TARGET" --env)"
+mode="$(eval "$env_out" 2>/dev/null; printf '%s' "${POWER_ACTIVE_NAME:-}")"
+if [[ "$mode" == '15W$(id)`id`' ]]; then
+  pass "POWER_ACTIVE_NAME carrying \$() and backticks survives eval as literal text"
+else
+  fail "POWER_ACTIVE_NAME round trip with shell metacharacters" "got '$mode'"
 fi
 
 # ══════════════════════════════════════════════════════════════════

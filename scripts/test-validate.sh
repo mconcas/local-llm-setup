@@ -183,7 +183,10 @@ class H(BaseHTTPRequestHandler):
         lps = [float("nan") if v == "nan" else v
                for v in c.get("logprobs", [-0.07, -3.2, -3.4, -3.5, -3.6])]
         if c.get("drift") and n > 0:
-            lps = [v - 0.5 for v in lps]
+            # drift_delta in nats: the default is a gap no reduction-order
+            # difference produces, a small one is the CUDA noise the check has
+            # to tolerate rather than report as corrupted memory.
+            lps = [v - c.get("drift_delta", 0.5) for v in lps]
             top = c.get("drift_token", top)
         alts = c.get("alt_tokens", [" located", " a", " __", " the"])
         entries = [{"token": top, "logprob": lps[0]}]
@@ -1154,7 +1157,18 @@ set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"emitted_token":" the"}'
 new_project; healthy_env "$P"
 run_jetson "$P" --runtime
 assert_fail "$OUT" "not the most probable one" "a non-argmax greedy token is caught"
-assert_contains "$OUT" "top alternative is 'cherry'" "names both tokens"
+# Unstripped, so a mismatch that is leading whitespace only does not read as
+# "emitted 'cherry', but the top alternative is 'cherry'".
+assert_contains "$OUT" "top alternative is ' cherry'" "names both tokens as the server spelled them"
+
+# The whitespace-only mismatch itself: a detokenisation that drops the leading
+# space is a real defect, and the message has to make it visible.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"emitted_token":"cherry"}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not the most probable one" "a whitespace-only argmax mismatch is caught"
+assert_contains "$OUT" "emitted 'cherry', but the top alternative is ' cherry'" \
+                "the two tokens are distinguishable in the message"
 
 # A near-flat distribution: five alternatives within a whisker of each other is
 # what corrupted weights or a truncated quant produce. The structure is still
@@ -1178,6 +1192,24 @@ assert_pass "$OUT" "probability mass" "a peaked but wrong answer still passes pe
 assert_fail "$OUT" "does not complete the repeated pattern" "the wrong continuation is caught"
 assert_contains "$OUT" "expected 'cherry', got 'banana'" "names both"
 
+# A vocabulary with no whole-word " cherry" token emits a subword of it first -
+# a 32k-vocab Llama-2 tokenizer splits it into " cher" + "ry". That is the
+# pattern being completed, so it must not read as a wrong continuation.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
+          "top_token":" cher","alt_tokens":[" banana"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "starts the repeated pattern" "a subword of the answer passes"
+assert_contains "$OUT" "opens 'cherry'" "says which word the token opens"
+
+# A subword that is not a prefix of the answer is still a wrong continuation:
+# the tolerance is for token boundaries, not for the answer.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
+          "top_token":" ban","alt_tokens":[" cherry"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "does not complete the repeated pattern" "an unrelated subword is still caught"
+
 # Two identical greedy requests over an uncached prompt must agree bit for bit.
 # They do on this board - measured to the last digit of the log-probability -
 # so divergence is memory being corrupted mid-run, not sampling noise.
@@ -1194,6 +1226,15 @@ new_project; healthy_env "$P"
 run_jetson "$P" --runtime
 assert_fail "$OUT" "same request twice gave different results" "a drifting token is caught"
 assert_contains "$OUT" "then 'apple'" "names what the second call returned"
+
+# llama.cpp assigns a slot per request and .env.example ships PARALLEL=4, so a
+# different slot or batch shape reorders the floating-point reduction on CUDA.
+# A log-probability that moves in the sixth decimal is that, not corruption -
+# a false red here would be very hard to diagnose from the message given.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"drift":true,"drift_delta":0.000001}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "same request twice" "reduction-order noise is not reported as corruption"
 
 # A build that reports no probabilities cannot be judged here. Four stated
 # skips, not four passes - the distinction this suite exists to hold.
@@ -1226,6 +1267,15 @@ set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"chat_content":"ok \u0001\u
 new_project; healthy_env "$P"
 run_jetson "$P" --runtime
 assert_fail "$OUT" "not readable output" "control bytes in the reply are caught"
+
+# A JSON null is a field the server declined to fill. Rendered as the Python
+# literal it becomes the four readable characters "None", which passed as a
+# working reply - the same vacuous shape the checks above exist to remove.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"chat_content":null}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "chat completion returned nothing" "a null content is caught"
+assert_not_contains "$OUT" "got: None" "and is never reported as readable output"
 
 # A paraphrase is still a working pipeline, and has to stay a pass - otherwise
 # this suite would be pinned to one model's phrasing.

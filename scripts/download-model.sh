@@ -557,8 +557,9 @@ if [[ "$1" == "--include" ]]; then
     exit 2
   fi
 
+  FIRST_REMOTE=""
   if (( TREE_RC == 0 )); then
-    SHARD_TOTAL=0; SHARD_COUNT=0; WEIGHT_TOTAL=0; FIRST_REMOTE=""
+    SHARD_TOTAL=0; SHARD_COUNT=0; WEIGHT_TOTAL=0
     while IFS=$'\t' read -r _sz _path; do
       [[ -z "$_path" ]] && continue
       SHARD_TOTAL=$((SHARD_TOTAL + _sz)); SHARD_COUNT=$((SHARD_COUNT + 1))
@@ -594,12 +595,39 @@ if [[ "$1" == "--include" ]]; then
     --include "$PATTERN" \
     --local-dir "$MODEL_DIR"
 
-  # Find the first shard for MODEL_FILE
-  SUBDIR="${PATTERN%%/*}"
-  FIRST_SHARD=$(find "$MODEL_DIR/$SUBDIR" -name '*00001-of-*.gguf' 2>/dev/null | head -1)
-  SINGLE_FILE=$(find "$MODEL_DIR/$SUBDIR" -name '*.gguf' ! -name '*-of-*' 2>/dev/null | head -1)
+  # Find the first shard for MODEL_FILE.
+  #
+  # A pattern is not always a directory prefix: `--include '*.gguf'` matches a
+  # flat repo, and the common bartowski/unsloth layout keeps its shards at the
+  # top level. `${PATTERN%%/*}` yields the whole pattern when there is no slash
+  # in it, so the searches below used to run against a literal `<dir>/*.gguf`
+  # path that cannot exist - which left TARGET empty and silently skipped the
+  # magic-byte verification this script exists to provide, while still printing
+  # "✔ Model downloaded to <dir>/*.gguf/".
+  if [[ "$PATTERN" == */* ]]; then SUBDIR="${PATTERN%%/*}"; else SUBDIR=""; fi
+  SEARCH_DIR="$MODEL_DIR${SUBDIR:+/$SUBDIR}"
 
-  TARGET="${FIRST_SHARD:-$SINGLE_FILE}"
+  # The tree listing already named the first shard, and it is the same path the
+  # fit check was made against, so prefer it over re-deriving one from a glob.
+  TARGET=""
+  if [[ -n "$FIRST_REMOTE" && -f "$MODEL_DIR/$FIRST_REMOTE" ]]; then
+    TARGET="$MODEL_DIR/$FIRST_REMOTE"
+  else
+    FIRST_SHARD=$(find "$SEARCH_DIR" -name '*00001-of-*.gguf' 2>/dev/null | head -1)
+    SINGLE_FILE=$(find "$SEARCH_DIR" -name '*.gguf' ! -name '*-of-*' 2>/dev/null | head -1)
+    TARGET="${FIRST_SHARD:-$SINGLE_FILE}"
+  fi
+
+  # A pattern that matched no weights at all is a supported pull (the fit check
+  # says so above) and there is nothing to verify. A pattern that did match
+  # weights and left none on disk is a failed transfer, and reporting it as a
+  # success is the shape this script exists to keep out.
+  if [[ -z "$TARGET" && -n "$FIRST_REMOTE" ]]; then
+    echo "" >&2
+    echo "Error: $FIRST_REMOTE was listed in $REPO but is not under $SEARCH_DIR/." >&2
+    echo "  The transfer did not leave the weights it was asked for." >&2
+    exit 1
+  fi
   if [[ -n "$TARGET" ]] && ! verify_gguf "$TARGET"; then
     echo ""
     echo "Error: $TARGET is not a valid GGUF file (bad magic bytes)." >&2
@@ -611,7 +639,7 @@ if [[ "$1" == "--include" ]]; then
   prune_partials quiet
 
   echo ""
-  echo "✔ Model downloaded to $MODEL_DIR/$SUBDIR/"
+  echo "✔ Model downloaded to $SEARCH_DIR/"
   echo ""
   if [[ -n "$TARGET" ]]; then
     REL_PATH="/models/${TARGET#"$MODEL_DIR/"}"

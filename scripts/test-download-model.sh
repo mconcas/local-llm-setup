@@ -1096,11 +1096,15 @@ json.dump({"pages": [[entry(sys.argv[2])], [entry(sys.argv[3])]]},
 PY
 }
 
-# mk_hf_stub - a huggingface-cli that records that it ran. "Nothing was
-# downloaded" has to be asserted on the CLI never being reached, not on an
-# empty directory: a CLI that ran and failed leaves one too.
+# mk_hf_stub [relative-path …] - a huggingface-cli that records that it ran and
+# lays down the files it was asked for, defaulting to the two-shard subdirectory
+# layout. "Nothing was downloaded" has to be asserted on the CLI never being
+# reached, not on an empty directory: a CLI that ran and failed leaves one too.
 HF_MARKER=""
 mk_hf_stub() {
+  local paths=("$@") p
+  (( ${#paths[@]} == 0 )) && paths=(Q4_K_M/shard-00001-of-00002.gguf \
+                                    Q4_K_M/shard-00002-of-00002.gguf)
   HF_MARKER="$PROJ/hf-ran"
   mkdir -p "$PROJ/.venv/bin"
   cat >"$PROJ/.venv/bin/hf" <<EOF
@@ -1108,10 +1112,11 @@ mk_hf_stub() {
 dir=""
 while [[ \$# -gt 0 ]]; do [[ "\$1" == "--local-dir" ]] && dir="\$2"; shift; done
 echo ran >"$HF_MARKER"
-mkdir -p "\$dir/Q4_K_M"
-cp "$FITGGUF" "\$dir/Q4_K_M/shard-00001-of-00002.gguf"
-cp "$FITGGUF" "\$dir/Q4_K_M/shard-00002-of-00002.gguf"
 EOF
+  for p in "${paths[@]}"; do
+    printf 'mkdir -p "$(dirname "$dir/%s")"\ncp %q "$dir/%s"\n' "$p" "$FITGGUF" "$p" \
+      >>"$PROJ/.venv/bin/hf"
+  done
   chmod +x "$PROJ/.venv/bin/hf"
 }
 expect_hf_ran() {
@@ -1263,6 +1268,54 @@ expect_out 'Download size : 2\.0 GiB'
 if [[ "$(grep -c '"path": "/api/' "$STUB_LOG")" -ge 2 ]]; then
   pass "both pages were requested"
 else fail "the next page was never fetched" "$(cat "$STUB_LOG")"; fi
+
+case_start "a pattern with no directory in it is still verified after the pull"
+# The bartowski/unsloth flat layout: shards at the top level, so the pattern
+# carries no slash. `${PATTERN%%/*}` yields the pattern itself there, and the
+# post-download search used to run against a literal "<dir>/*.gguf" path that
+# cannot exist - which skipped the magic-byte check, dropped the MODEL_FILE
+# hint, and reported "✔ Model downloaded to <dir>/*.gguf/".
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+mk_hf_stub flat-00001-of-00002.gguf flat-00002-of-00002.gguf
+mk_tree "$TREE" "$((1024 * MIB)):flat-00001-of-00002.gguf" \
+                "$((1024 * MIB)):flat-00002-of-00002.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include '*.gguf'
+expect_rc 0 "a flat sharded set"
+expect_hf_ran
+expect_out 'MODEL_FILE=/models/flat-00001-of-00002\.gguf'
+expect_out "Model downloaded to $MODELS/"
+expect_not_out '\*\.gguf/'
+
+# The differential that proves the magic-byte check actually ran on this path:
+# the same pull with a body that is not a GGUF has to be refused.
+new_project; MODELS="$PROJ/models"
+NOTGGUF="$TMPROOT/not-a.gguf"; printf '<!DOCTYPE html><html>login</html>' >"$NOTGGUF"
+FITGGUF_SAVED="$FITGGUF"; FITGGUF="$NOTGGUF"
+mk_hf_stub flat-00001-of-00002.gguf flat-00002-of-00002.gguf
+FITGGUF="$FITGGUF_SAVED"
+mk_tree "$TREE" "$((1024 * MIB)):flat-00001-of-00002.gguf" \
+                "$((1024 * MIB)):flat-00002-of-00002.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include '*.gguf'
+expect_rc 1 "a flat set whose shards are not GGUF"
+expect_out 'not a valid GGUF'
+expect_not_out 'Model downloaded'
+
+# A pattern that matched weights and left none behind is a failed transfer,
+# not a success with nothing to verify.
+new_project; MODELS="$PROJ/models"
+mk_hf_stub Q4_K_M/README.md
+mk_tree "$TREE" "$((1024 * MIB)):Q4_K_M/model.gguf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 1 "the weights never landed"
+expect_out 'did not leave the weights'
+expect_not_out 'Model downloaded'
 
 case_start "a listing that cannot be read says so instead of reading as a pass"
 new_project; MODELS="$PROJ/models"

@@ -216,30 +216,35 @@ power_probe "$SYSROOT"
 
 # ── Output ────────────────────────────────────────────────────────
 if (( EMIT_ENV )); then
-  cat <<EOF
-PLATFORM_KIND=$PLATFORM_KIND
-PLATFORM_ARCH=$PLATFORM_ARCH
-PLATFORM_LABEL="$PLATFORM_LABEL"
-L4T_VERSION=$L4T_VERSION
-TOTAL_MEM_MB=$TOTAL_MEM_MB
-GPU_MEM_MB=$GPU_MEM_MB
-GPU_ACCESS=$GPU_ACCESS
-COMPOSE_FILES=$COMPOSE_FILES
-LLAMA_IMAGE=$LLAMA_IMAGE
-REC_MODEL_REPO=$REC_MODEL_REPO
-REC_MODEL_FILE=$REC_MODEL_FILE
-REC_MODEL_MB=$REC_MODEL_MB
-REC_CTX_SIZE=$REC_CTX_SIZE
-REC_PARALLEL=$REC_PARALLEL
-REC_CACHE_TYPE=$REC_CACHE_TYPE
-REC_MODEL_PCT=$REC_MODEL_PCT
-POWER_STATE=$POWER_STATE
-POWER_ACTIVE_ID=$POWER_ACTIVE_ID
-POWER_ACTIVE_NAME="$POWER_ACTIVE_NAME"
-POWER_BEST_ID=$POWER_BEST_ID
-POWER_BEST_NAME="$POWER_BEST_NAME"
-POWER_DEFAULT_ID=$POWER_DEFAULT_ID
-EOF
+  # Four scripts eval this block, and several of the values are host-derived
+  # free text: /proc/device-tree/model, the nvidia-smi product name, the NAME=
+  # field of /etc/nvpmodel.conf. Inside double quotes `$`, a backtick and a
+  # backslash still expand, so a board whose label carries one would run in the
+  # consumer's shell. %q is the quoting eval reverses exactly, which is the
+  # contract lib/gguf.py already holds itself to for its own eval'd output.
+  env_line() { printf '%s=%q\n' "$1" "$2"; }
+  env_line PLATFORM_KIND "$PLATFORM_KIND"
+  env_line PLATFORM_ARCH "$PLATFORM_ARCH"
+  env_line PLATFORM_LABEL "$PLATFORM_LABEL"
+  env_line L4T_VERSION "$L4T_VERSION"
+  env_line TOTAL_MEM_MB "$TOTAL_MEM_MB"
+  env_line GPU_MEM_MB "$GPU_MEM_MB"
+  env_line GPU_ACCESS "$GPU_ACCESS"
+  env_line COMPOSE_FILES "$COMPOSE_FILES"
+  env_line LLAMA_IMAGE "$LLAMA_IMAGE"
+  env_line REC_MODEL_REPO "$REC_MODEL_REPO"
+  env_line REC_MODEL_FILE "$REC_MODEL_FILE"
+  env_line REC_MODEL_MB "$REC_MODEL_MB"
+  env_line REC_CTX_SIZE "$REC_CTX_SIZE"
+  env_line REC_PARALLEL "$REC_PARALLEL"
+  env_line REC_CACHE_TYPE "$REC_CACHE_TYPE"
+  env_line REC_MODEL_PCT "$REC_MODEL_PCT"
+  env_line POWER_STATE "$POWER_STATE"
+  env_line POWER_ACTIVE_ID "$POWER_ACTIVE_ID"
+  env_line POWER_ACTIVE_NAME "$POWER_ACTIVE_NAME"
+  env_line POWER_BEST_ID "$POWER_BEST_ID"
+  env_line POWER_BEST_NAME "$POWER_BEST_NAME"
+  env_line POWER_DEFAULT_ID "$POWER_DEFAULT_ID"
   exit 0
 fi
 
