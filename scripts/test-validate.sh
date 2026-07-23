@@ -152,10 +152,60 @@ class H(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    # The output-correctness probe. Defaults model a healthy greedy step on the
+    # repeated-pattern prompt; every knob below is one way a broken offload
+    # answers 200 with numbers that are not the model's.
+    def _completion(self, c):
+        if c.get("completion_404"):
+            self._json(404, {"error": "not found"})
+            return
+        if c.get("no_probs"):
+            # A build compiled without probability reporting, or a proxy that
+            # strips the field. Nothing to judge - validate.sh must skip.
+            self._json(200, {"content": " cherry"})
+            return
+        top = c.get("top_token", " cherry")
+        # Second and later calls can differ, which is how a nondeterministic
+        # run is simulated: the counter lives in the control file's directory.
+        seq = os.path.join(os.path.dirname(CTL), "probe.count")
+        n = 0
+        try:
+            with open(seq) as f:
+                n = int(f.read() or 0)
+        except Exception:
+            pass
+        with open(seq, "w") as f:
+            f.write(str(n + 1))
+        # "nan" in the control file becomes a real NaN in the response body.
+        # llama.cpp's JSON writer renders a NaN logit as null, but a build that
+        # emits the literal has to be rejected too, so both spellings are
+        # reachable: null straight through, "nan" via this substitution.
+        lps = [float("nan") if v == "nan" else v
+               for v in c.get("logprobs", [-0.07, -3.2, -3.4, -3.5, -3.6])]
+        if c.get("drift") and n > 0:
+            lps = [v - 0.5 for v in lps]
+            top = c.get("drift_token", top)
+        alts = c.get("alt_tokens", [" located", " a", " __", " the"])
+        entries = [{"token": top, "logprob": lps[0]}]
+        entries += [{"token": t, "logprob": v} for t, v in zip(alts, lps[1:])]
+        emitted = c.get("emitted_token", top)
+        self._json(200, {
+            "content": emitted,
+            "completion_probabilities": [{
+                "token": emitted,
+                "logprob": lps[0] if emitted == top else lps[-1],
+                "top_logprobs": entries,
+            }],
+        })
+
     def do_POST(self):
         c = ctl()
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
+
+        if self.path.rstrip("/").endswith("/completion"):
+            self._completion(c)
+            return
 
         if req.get("stream"):
             # Sent with a Content-Length rather than incrementally: validate.sh
@@ -186,7 +236,11 @@ class H(BaseHTTPRequestHandler):
         if c.get("chat_broken"):
             self._json(500, {"error": "stub: out of memory"})
             return
-        self._json(200, {"choices": [{"message": {"content": "JETSON OK"}}]})
+        # chat_content carries \uXXXX escapes through the control file, so a
+        # case can hand back the C0 bytes a corrupted detokenisation emits as
+        # well as ordinary prose.
+        self._json(200, {"choices": [{"message": {
+            "content": c.get("chat_content", "JETSON OK")}}]})
 
 
 srv = HTTPServer(("127.0.0.1", 0), H)
@@ -200,7 +254,9 @@ srv.serve_forever()
 PYEOF
 
 CTL="$TMPROOT/control.json"
-set_ctl() { printf '%s' "$1" >"$CTL"; }
+# The probe counter is reset with the control file, so the "drift" knob cannot
+# leak a second-call response into the next case's first call.
+set_ctl() { printf '%s' "$1" >"$CTL"; rm -f "$TMPROOT/probe.count"; }
 set_ctl '{}'
 
 # ── TLS material ──────────────────────────────────────────────────
@@ -1045,6 +1101,139 @@ new_project; healthy_env "$P"
 run_jetson "$P" --runtime
 assert_fail "$OUT" "structured tool_calls block" "a prose tool call is caught"
 assert_contains "$OUT" "LLAMA_ARG_JINJA=1" "names the setting"
+
+# ══════════════════════════════════════════════════════════════════
+case_start "Runtime: the output is the one the model computes"
+# ══════════════════════════════════════════════════════════════════
+# Every check above is satisfied by a server that answers at all. These drive
+# the shapes a partially broken offload produces: a 200 whose body is fluent in
+# structure and wrong in content. None of them is reachable from a healthy
+# board, which is the whole reason they are stubbed.
+
+# The baseline, so the failures below are read against a known-clean run.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "token distribution is well formed" "a healthy distribution passes"
+assert_pass "$OUT" "probability mass" "a peaked distribution passes"
+assert_pass "$OUT" "completes the repeated pattern" "the induction answer passes"
+assert_pass "$OUT" "same request twice" "a deterministic server passes"
+assert_contains "$OUT" "5 alternatives" "reports how many alternatives it judged"
+
+# NaN in the logits is what a kernel compiled for the wrong architecture
+# produces once it runs at all. It reaches the client as a valid 200.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"logprobs":["nan",-3.2,-3.4,-3.5,-3.6]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not a finite number" "a NaN log-probability is caught"
+assert_contains "$OUT" "GPU_LAYERS=0" "names the way to tell the kernels from the model"
+assert_skip "$OUT" "how peaked the distribution is" "peakedness is skipped, not judged on a NaN"
+
+# llama.cpp's JSON writer renders a NaN as null rather than as the literal, so
+# the same defect arrives in two spellings and both have to go red.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"logprobs":[null,-3.2,-3.4,-3.5,-3.6]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not a finite number" "a null log-probability is caught too"
+
+# A positive log-probability is a probability above 1 - arithmetic that cannot
+# be right whatever the model is.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"logprobs":[2.5,-3.2,-3.4,-3.5,-3.6]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not a finite number" "a log-probability above 0 is caught"
+
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"logprobs":[-3.6,-0.07,-3.4,-3.5,-3.2]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not ranked by probability" "an unordered alternative list is caught"
+
+# Greedy decoding that does not emit the argmax means the sampler and the
+# scorer are looking at different logits.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"emitted_token":" the"}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not the most probable one" "a non-argmax greedy token is caught"
+assert_contains "$OUT" "top alternative is 'cherry'" "names both tokens"
+
+# A near-flat distribution: five alternatives within a whisker of each other is
+# what corrupted weights or a truncated quant produce. The structure is still
+# perfect, which is exactly why the previous checks cannot see it.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
+          "logprobs":[-4.6,-4.7,-4.8,-4.9,-5.0]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "token distribution is well formed" "the structure still passes"
+assert_fail "$OUT" "not confident on a trivially predictable continuation" "a flat distribution is caught"
+assert_contains "$OUT" "(1%)" "reports the mass it measured"
+assert_contains "$OUT" "published checksum" "names the checks that separate weights from kernels"
+
+# Confident and wrong: the pattern is four repetitions of one cycle, so a model
+# that answers anything else is not attending to its own context.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
+          "top_token":" banana","alt_tokens":[" cherry"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "probability mass" "a peaked but wrong answer still passes peakedness"
+assert_fail "$OUT" "does not complete the repeated pattern" "the wrong continuation is caught"
+assert_contains "$OUT" "expected 'cherry', got 'banana'" "names both"
+
+# Two identical greedy requests over an uncached prompt must agree bit for bit.
+# They do on this board - measured to the last digit of the log-probability -
+# so divergence is memory being corrupted mid-run, not sampling noise.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"drift":true}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "token distribution is well formed" "the first call still looks healthy"
+assert_fail "$OUT" "same request twice gave different results" "a drifting server is caught"
+assert_contains "$OUT" "corrupted mid-run" "names the cause"
+
+# The token changing between calls, with the numbers otherwise plausible.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"drift":true,"drift_token":" apple"}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "same request twice gave different results" "a drifting token is caught"
+assert_contains "$OUT" "then 'apple'" "names what the second call returned"
+
+# A build that reports no probabilities cannot be judged here. Four stated
+# skips, not four passes - the distinction this suite exists to hold.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"no_probs":true}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_skip "$OUT" "cannot judge output correctness" "no probabilities skips the structure check"
+assert_skip "$OUT" "cannot judge the probability mass" "and the peakedness check"
+assert_skip "$OUT" "cannot judge the continuation" "and the continuation check"
+assert_skip "$OUT" "cannot judge determinism" "and the determinism check"
+assert_contains "$OUT" "does not report token probabilities" "states why"
+assert_exit "$RC" 0 "a skip does not fail the run"
+
+# --base pointed at an OpenAI-compatible proxy that has no /completion.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"completion_404":true}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_skip "$OUT" "cannot judge output correctness" "an absent /completion skips"
+assert_contains "$OUT" "/completion did not answer" "states that the endpoint is the reason"
+
+# The chat reply itself: any non-empty body used to be a PASS, so a corrupted
+# detokenisation reporting a run of one character read as a working model.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"chat_content":"!!!!!!!!!!!!"}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not readable output" "a single repeated character is caught"
+assert_contains "$OUT" "corrupted GPU offload" "names what produces it"
+
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"chat_content":"ok \u0001\u0007 here"}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not readable output" "control bytes in the reply are caught"
+
+# A paraphrase is still a working pipeline, and has to stay a pass - otherwise
+# this suite would be pinned to one model's phrasing.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
+          "chat_content":"Sure - JETSON is OK, as requested."}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "chat completion produced readable output" "a paraphrase still passes"
 
 # ══════════════════════════════════════════════════════════════════
 case_start "Runtime: TLS enforcement"

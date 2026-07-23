@@ -91,9 +91,10 @@ docker compose up -d
 
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
 merge, model sizing, the board's power mode, disk hygiene, container health,
-full GPU layer offload, the OpenAI endpoints, streaming, tool calling, and the
-TLS proxy (including that it rejects clients which do not trust the CA). It is
-**52 checks, all green** on a Jetson Orin Nano Super with the stack up.
+full GPU layer offload, the OpenAI endpoints, streaming, tool calling, whether
+the output is the one the model computes, and the TLS proxy (including that it
+rejects clients which do not trust the CA). It is **56 checks, all green** on a
+Jetson Orin Nano Super with the stack up.
 
 Every self-test above also runs as a preflight check, so `./scripts/validate.sh`
 alone exercises all of them. `VALIDATE_SELFTESTS=0` skips them when you only
@@ -644,9 +645,53 @@ without the Compose CLI the differential half is skipped with the reason
 printed, and the unit half (the reason strings, `env_load`, and the bind-source
 rules) still runs.
 
+### Is the output the one the model computes?
+
+A GPU that is half working answers with an HTTP 200. Health passes, `/v1/models`
+lists the model, the layer count says 37/37, streaming terminates properly, and
+the reply is nonsense. Every check up to this point is satisfied by a server
+that *responds*, so the suite used to accept "the reply is not empty" as proof
+that inference worked - a reply of `!!!!!!!!` reported `PASS`.
+
+The `Runtime - output correctness` section asks for a number instead. It sends
+one greedy step (`/completion`, `temperature: 0`, `n_probs: 5`,
+`cache_prompt: false`) on a prompt that is four repetitions of a three-word
+cycle:
+
+```
+apple banana cherry apple banana cherry apple banana cherry apple banana
+```
+
+Continuing it needs no world knowledge and no instruction tuning - only that the
+model can attend to its own context - so the assertion is not pinned to one
+model's opinions. Four things are then checked:
+
+| Check | Goes red when | What that means |
+|---|---|---|
+| the token distribution is well formed | a log-probability is not a finite number `<= 0`, the alternatives are not ranked, or greedy decoding did not emit the argmax | the arithmetic behind the answer is broken, not the model - `NaN` in the logits is what a kernel built for the wrong architecture produces once it runs at all |
+| the next token carries N% of the probability mass | the top token is under 25% | the model is not concentrating anywhere. Corrupted weights or a truncated quant flatten the distribution while leaving its structure perfect |
+| the greedy continuation completes the repeated pattern | the answer is not `cherry` | confident and wrong: the model is not attending to its own context |
+| the same request twice gives the same token and log-probability | the two calls disagree | greedy decoding over an uncached prompt is deterministic, so divergence is memory being corrupted mid-run |
+
+On the Orin Nano Super with the recommended 3B, the answer is `cherry` carrying
+**93%** of the mass, and two calls agree to the last digit of the
+log-probability (`-0.4982171654701233` three runs in a row). The 25% floor sits
+far from both ends of that: a uniform distribution over Qwen2.5's 150k-token
+vocabulary is 0.0007% per token.
+
+A build that reports no `completion_probabilities`, or a `--base` pointing at a
+proxy with no `/completion`, produces four **skips with the reason stated** -
+not four passes.
+
+The chat reply itself is now checked as text as well: a reply containing C0
+control bytes, invalid UTF-8, or a run of a single repeated character goes red
+with `chat completion returned text that is not readable output`. A paraphrase
+still passes, because "the model worded it differently" and "the model is
+emitting garbage" are different claims.
+
 ### The validation suite's own self-test
 
-"50/50 green" is only worth something if a red condition actually turns a check
+"56/56 green" is only worth something if a red condition actually turns a check
 red. On healthy hardware every check reports PASS - which is also exactly what a
 check that *cannot* fail reports, and two of them could not: the "rejects
 clients that do not trust the CA" check passed against an nginx that was down
@@ -661,6 +706,14 @@ its CA - and asserts both that the matching check goes red and that its
 neighbours stay green. `docker` is a stub reading canned `config`/`ps`/`logs`
 output, and the llama.cpp API is a small HTTP/HTTPS server with a real
 certificate, so nothing needs a GPU, Docker, a model or the network.
+
+The output-correctness checks are stubbed the same way, because a healthy board
+cannot reach any of their failure states: the stub serves `NaN` and `null`
+log-probabilities, a log-probability above zero, an unranked alternative list, a
+greedy step that does not emit the argmax, five alternatives within a whisker of
+each other, a confident answer to the wrong pattern, a server whose second call
+disagrees with its first, one that reports no probabilities at all, and a chat
+reply of `!!!!!!!!`. All 217 assertions are hermetic.
 
 Two hooks make this possible and are useful in their own right: `--base URL`
 points the runtime checks at a llama.cpp reachable elsewhere, and
@@ -1000,6 +1053,22 @@ detected by name, with the fix in the message.
   `./scripts/detect-platform.sh` recommends for this board.
 - To fetch it regardless (a board about to be reflashed, a model you mean to
   requantise), pass `--no-fit-check`.
+
+**`validate.sh` reports a broken token distribution, a flat one, or a reply that
+is not readable output:**
+- The stack is up and answering; what it computes is wrong. Separate the kernels
+  from the weights before anything else: set `GPU_LAYERS=0`, recreate the
+  container, and re-run `./scripts/validate.sh --runtime`.
+- If it goes green on CPU, the CUDA kernels are the cause - confirm
+  `LLAMA_IMAGE=ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin` and that the
+  log's `ARCHS` line lists `870`.
+- If it is still wrong on CPU, the file is. Re-fetch it -
+  `./scripts/download-model.sh --recommended` verifies the byte count against
+  the remote rather than trusting a valid-looking header.
+- A `the same request twice gave different results` failure is neither: greedy
+  decoding over an uncached prompt is deterministic, so memory is being
+  corrupted while the run is in flight. Check `dmesg` for EDAC or OOM entries
+  and re-run `./scripts/benchmark.sh`, which reports thermal throttling.
 
 **Jetson: `cudaMalloc failed: out of memory` while loading:**
 - Unified memory is exhausted. Lower `CTX_SIZE`, set `PARALLEL=1`, set

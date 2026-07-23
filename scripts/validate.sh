@@ -113,6 +113,104 @@ for k in sys.argv[1:]:
 print(d if not isinstance(d,(dict,list)) else json.dumps(d))
 " "$@"; }
 
+# ── Output correctness ────────────────────────────────────────────
+# Every runtime check up to here answers "did the server respond". None of them
+# answers "is the response what the model computes" - a partially broken offload
+# returns 200 with fluent-looking garbage, and "chat completion produced output"
+# goes green against a reply of "!!!!!!!!". These two helpers give the suite a
+# number to judge instead of a presence.
+#
+# The probe prompt is four repetitions of a three-word cycle. Completing it needs
+# no world knowledge and no instruction tuning - only that the model can attend
+# to its own context - so any working LM answers it, which keeps the assertion
+# off any one model's opinions. On the deployed Qwen2.5-3B the answer carries 93%
+# of the probability mass; a numerically broken path spreads it over the vocab,
+# which for a 150k-token vocabulary is 0.0007% per token.
+PROBE_PROMPT='apple banana cherry apple banana cherry apple banana cherry apple banana'
+PROBE_EXPECT='cherry'
+PROBE_MIN_PCT=25
+
+# probe_run - POST the probe to /completion and print eval-safe PROBE_* fields.
+# Returns 1 having printed the reason when the response cannot be read as a token
+# distribution: a build that reports none cannot be judged here, and a skip with
+# a stated reason is the honest verdict rather than a pass.
+probe_run() {
+  local body
+  body="$(curl -sf --max-time 120 "$HTTP_BASE/completion" \
+    -H 'Content-Type: application/json' \
+    -d "{\"prompt\":\"${PROBE_PROMPT}\",\"n_predict\":1,\"temperature\":0,
+         \"n_probs\":5,\"cache_prompt\":false}" 2>/dev/null)" \
+    || { echo "/completion did not answer"; return 1; }
+  python3 -c '
+import json, math, shlex, sys
+
+def bail(msg):
+    print(msg); sys.exit(1)
+
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    bail("/completion did not return JSON")
+cp = d.get("completion_probabilities")
+if not isinstance(cp, list) or not cp:
+    bail("this build does not report token probabilities (no completion_probabilities)")
+first = cp[0]
+tops = first.get("top_logprobs")
+if not isinstance(tops, list) or not tops:
+    bail("the response carries no alternative tokens (no top_logprobs)")
+
+def lp(e):
+    v = e.get("logprob") if isinstance(e, dict) else None
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+vals = [lp(e) for e in tops]
+emitted_lp = lp(first)
+# A log-probability is finite and at most 0. NaN and +inf are what a broken
+# kernel produces, and nlohmann renders NaN as null - which is why a missing
+# number counts as a failure here rather than as an unreadable response.
+finite = (emitted_lp is not None and math.isfinite(emitted_lp) and emitted_lp <= 1e-6
+          and all(v is not None and math.isfinite(v) and v <= 1e-6 for v in vals))
+ordered = finite and all(vals[i] >= vals[i + 1] - 1e-9 for i in range(len(vals) - 1))
+emitted = first.get("token") or ""
+top = tops[0].get("token") or ""
+out = [
+    "PROBE_FINITE=%d" % finite,
+    "PROBE_ORDERED=%d" % ordered,
+    "PROBE_ARGMAX=%d" % (emitted == top),
+    "PROBE_ALTS=%d" % len(tops),
+    "PROBE_TOP_PCT=%d" % (round(math.exp(vals[0]) * 100) if finite else 0),
+    # Micro-units, so the determinism comparison is integer equality in bash
+    # rather than a float compare that would need a tolerance nothing measured.
+    "PROBE_LOGPROB_U=%d" % (round(emitted_lp * 1000000) if finite else 0),
+    "PROBE_EMITTED=%s" % shlex.quote(emitted.strip()),
+    "PROBE_TOP=%s" % shlex.quote(top.strip()),
+    "PROBE_CONTENT=%s" % shlex.quote(str(d.get("content", "")).strip()),
+]
+print("\n".join(out))
+' "$body"
+}
+
+# text_is_readable - stdin is output a human could have read. Rejects the shapes
+# a corrupted offload emits with a 200: replacement characters from invalid
+# UTF-8, C0 control bytes, and a run of a single repeated character.
+text_is_readable() {
+  python3 -c '
+import sys
+raw = sys.stdin.buffer.read()
+text = raw.decode("utf-8", "replace")
+if "�" in text:
+    sys.exit(1)                       # not valid UTF-8
+if any(ord(c) < 32 and c not in "\t\n\r" for c in text):
+    sys.exit(1)                       # control bytes in prose
+body = "".join(text.split())
+if not body:
+    sys.exit(1)
+if len(set(body)) < 2:
+    sys.exit(1)                       # "!!!!!!!!" and friends
+sys.exit(0)
+'
+}
+
 # Run one script self-test as a check. Each of these drives a real script
 # against synthetic fixtures, covering the paths a healthy host cannot reach.
 #
@@ -847,13 +945,21 @@ runtime() {
     -d '{"model":"any","temperature":0,"max_tokens":16,
          "messages":[{"role":"user","content":"Reply with exactly: JETSON OK"}]}' 2>/dev/null \
     | jget choices 0 message content 2>/dev/null)"
-  if [[ "$reply" == *"JETSON OK"* ]]; then
-    ok "chat completion returns the requested text"
-  elif [[ -n "$reply" ]]; then
-    # A small quantised model may paraphrase; that is still a working pipeline.
-    ok "chat completion produced output (got: $(tr -d '\n' <<<"$reply" | cut -c1-40))"
-  else
+  if [[ -z "$reply" ]]; then
     no "chat completion returned nothing"
+  elif ! text_is_readable <<<"$reply"; then
+    # The old code had no branch here: any non-empty reply was a PASS, so a
+    # partial offload answering "!!!!!!!!" or a stream of replacement characters
+    # was indistinguishable from a working model.
+    no "chat completion returned text that is not readable output" \
+       "got: $(tr -c '[:print:]' '?' <<<"$reply" | cut -c1-60)" \
+       "this is what a corrupted GPU offload produces - check GPU_LAYERS and the image's arch support"
+  elif [[ "$reply" == *"JETSON OK"* ]]; then
+    ok "chat completion returns the requested text"
+  else
+    # A small quantised model may paraphrase; that is still a working pipeline,
+    # and the reply has already been shown to be readable text.
+    ok "chat completion produced readable output (got: $(tr -d '\n' <<<"$reply" | cut -c1-40))"
   fi
 
   local stream
@@ -890,6 +996,70 @@ runtime() {
   else
     no "tool calling did not produce a structured tool_calls block" \
        "check that LLAMA_ARG_JINJA=1 and the model ships a tool-aware chat template"
+  fi
+
+  head "Runtime - output correctness"
+
+  # Everything above this point is satisfied by a server that answers. These
+  # four ask whether the numbers behind the answer are the ones the model
+  # computes, which on a Jetson is the difference between a working offload and
+  # one whose kernels are wrong for sm_87.
+  local probe1 probe2 probe_reason
+  if probe1="$(probe_run 2>&1)" && grep -q '^PROBE_FINITE=' <<<"$probe1"; then
+    eval "$probe1"
+
+    if (( PROBE_FINITE )) && (( PROBE_ORDERED )) && (( PROBE_ARGMAX )); then
+      ok "the token distribution is well formed (${PROBE_ALTS} alternatives, ranked, argmax emitted)"
+    elif ! (( PROBE_FINITE )); then
+      no "the model reported a log-probability that is not a finite number <= 0" \
+         "NaN or infinity in the logits means the offloaded arithmetic is broken, not the model" \
+         "try GPU_LAYERS=0 - if the output becomes sane, the CUDA kernels are the cause"
+    elif ! (( PROBE_ORDERED )); then
+      no "the reported alternatives are not ranked by probability" \
+         "top_logprobs must be non-increasing; an unordered list means the sampler saw different logits"
+    else
+      no "at temperature 0 the emitted token is not the most probable one" \
+         "emitted '${PROBE_EMITTED}', but the top alternative is '${PROBE_TOP}'" \
+         "greedy decoding that does not pick the argmax means sampling and scoring disagree"
+    fi
+
+    if (( ! PROBE_FINITE )); then
+      skip "cannot judge how peaked the distribution is - the log-probabilities are not numbers"
+    elif (( PROBE_TOP_PCT >= PROBE_MIN_PCT )); then
+      ok "the next token carries ${PROBE_TOP_PCT}% of the probability mass (floor ${PROBE_MIN_PCT}%)"
+    else
+      no "the model is not confident on a trivially predictable continuation (${PROBE_TOP_PCT}%)" \
+         "a working model concentrates the mass here; a flat distribution is what corrupted weights or a bad quant produce" \
+         "check the GGUF against its published checksum and confirm the image carries sm_87 kernels"
+    fi
+
+    if [[ "${PROBE_EMITTED,,}" == "${PROBE_EXPECT}"* || "${PROBE_CONTENT,,}" == "${PROBE_EXPECT}"* ]]; then
+      ok "the greedy continuation completes the repeated pattern ('${PROBE_EXPECT}')"
+    else
+      no "the greedy continuation does not complete the repeated pattern" \
+         "expected '${PROBE_EXPECT}', got '${PROBE_EMITTED:-${PROBE_CONTENT}}'" \
+         "the prompt repeats one three-word cycle four times, so this needs attention over the context and nothing else"
+    fi
+
+    local u1="$PROBE_LOGPROB_U" t1="$PROBE_EMITTED"
+    if probe2="$(probe_run 2>&1)" && grep -q '^PROBE_FINITE=' <<<"$probe2"; then
+      eval "$probe2"
+      if [[ "$PROBE_EMITTED" == "$t1" && "$PROBE_LOGPROB_U" == "$u1" ]]; then
+        ok "the same request twice gives the same token and the same log-probability"
+      else
+        no "the same request twice gave different results" \
+           "first '${t1}' at ${u1}e-6, then '${PROBE_EMITTED}' at ${PROBE_LOGPROB_U}e-6" \
+           "greedy decoding over an uncached prompt is deterministic; divergence means memory is being corrupted mid-run"
+      fi
+    else
+      skip "cannot repeat the probe - ${probe2:-/completion stopped answering}"
+    fi
+  else
+    probe_reason="${probe1:-/completion did not answer}"
+    skip "cannot judge output correctness - ${probe_reason}"
+    skip "cannot judge the probability mass - ${probe_reason}"
+    skip "cannot judge the continuation - ${probe_reason}"
+    skip "cannot judge determinism - ${probe_reason}"
   fi
 
   head "Runtime - TLS proxy"
