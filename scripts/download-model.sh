@@ -609,12 +609,24 @@ if [[ "$1" == "--include" ]]; then
 
   # The tree listing already named the first shard, and it is the same path the
   # fit check was made against, so prefer it over re-deriving one from a glob.
+  #
+  # The glob is the fallback for a listing that could not be read at all, or for
+  # weights that were listed and did not arrive under the name they were listed
+  # with. A listing that was read and named no .gguf is authoritative: this pull
+  # asked for no weights, so there is nothing here to find and a glob could only
+  # turn up a model left behind by an earlier download. With a slash-free
+  # pattern SEARCH_DIR is the whole models directory, which is exactly where
+  # such a leftover lives - hence the depth limit as well.
+  DEPTH=()
+  [[ -z "$SUBDIR" ]] && DEPTH=(-maxdepth 1)
   TARGET=""
   if [[ -n "$FIRST_REMOTE" && -f "$MODEL_DIR/$FIRST_REMOTE" ]]; then
     TARGET="$MODEL_DIR/$FIRST_REMOTE"
-  else
-    FIRST_SHARD=$(find "$SEARCH_DIR" -name '*00001-of-*.gguf' 2>/dev/null | head -1)
-    SINGLE_FILE=$(find "$SEARCH_DIR" -name '*.gguf' ! -name '*-of-*' 2>/dev/null | head -1)
+  elif [[ -n "$FIRST_REMOTE" ]] || (( TREE_RC != 0 )); then
+    FIRST_SHARD=$(find "$SEARCH_DIR" ${DEPTH[@]+"${DEPTH[@]}"} \
+                       -name '*00001-of-*.gguf' 2>/dev/null | head -1)
+    SINGLE_FILE=$(find "$SEARCH_DIR" ${DEPTH[@]+"${DEPTH[@]}"} \
+                       -name '*.gguf' ! -name '*-of-*' 2>/dev/null | head -1)
     TARGET="${FIRST_SHARD:-$SINGLE_FILE}"
   fi
 

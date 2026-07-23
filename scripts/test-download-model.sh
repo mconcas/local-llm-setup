@@ -1105,6 +1105,9 @@ mk_hf_stub() {
   local paths=("$@") p
   (( ${#paths[@]} == 0 )) && paths=(Q4_K_M/shard-00001-of-00002.gguf \
                                     Q4_K_M/shard-00002-of-00002.gguf)
+  # "nothing" is a CLI that ran and transferred no file, which is what a
+  # pattern matching only non-weights leaves behind on the .gguf side.
+  [[ "${paths[0]}" == nothing ]] && paths=()
   HF_MARKER="$PROJ/hf-ran"
   mkdir -p "$PROJ/.venv/bin"
   cat >"$PROJ/.venv/bin/hf" <<EOF
@@ -1316,6 +1319,37 @@ run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
 expect_rc 1 "the weights never landed"
 expect_out 'did not leave the weights'
 expect_not_out 'Model downloaded'
+
+# A slash-free pattern makes the search directory the whole models directory,
+# where a model from an earlier download lives. A listing that was read and
+# named no .gguf settles that this pull asked for no weights, so nothing may be
+# adopted from that directory and reported as what was just fetched.
+new_project; MODELS="$PROJ/models"
+mkdir -p "$MODELS"; cp "$FITGGUF" "$MODELS/from-last-week.gguf"
+mk_hf_stub notes.txt
+mk_tree "$TREE" "$((1024 * MIB)):notes.txt"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES" "$TREE"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include '*.txt'
+expect_rc 0 "a pattern that matched no weights"
+expect_out 'Fit check     : skipped \(no \.gguf among the matched files\)'
+expect_not_out 'MODEL_FILE='
+expect_not_out 'from-last-week'
+
+# The same directory, reached through the other route into the glob: a listing
+# that could not be read at all. The search is capped at the top level, which
+# is where a slash-free pattern puts its files, so a model sitting in some
+# subdirectory of models/ is not mistaken for this pull's.
+new_project; MODELS="$PROJ/models"
+mkdir -p "$MODELS/older-quant"; cp "$FITGGUF" "$MODELS/older-quant/kept.gguf"
+mk_hf_stub nothing
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"      # no tree fixture: the API 404s
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include '*.gguf'
+expect_rc 0 "an unreadable listing does not block the pull"
+expect_out 'Download size : unknown'
+expect_not_out 'MODEL_FILE='
+expect_not_out 'kept\.gguf'
 
 case_start "a listing that cannot be read says so instead of reading as a pass"
 new_project; MODELS="$PROJ/models"

@@ -192,8 +192,11 @@ class H(BaseHTTPRequestHandler):
         entries = [{"token": top, "logprob": lps[0]}]
         entries += [{"token": t, "logprob": v} for t, v in zip(alts, lps[1:])]
         emitted = c.get("emitted_token", top)
+        # n_predict is 4, so the assembled text is not the first token in
+        # general: "probe_content" is how a case says what the whole generation
+        # came to when that differs from the token the distribution describes.
         self._json(200, {
-            "content": emitted,
+            "content": c.get("probe_content", emitted),
             "completion_probabilities": [{
                 "token": emitted,
                 "logprob": lps[0] if emitted == top else lps[-1],
@@ -1209,6 +1212,53 @@ set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
 new_project; healthy_env "$P"
 run_jetson "$P" --runtime
 assert_fail "$OUT" "does not complete the repeated pattern" "an unrelated subword is still caught"
+
+# The tolerance is judged on everything the model said, not on its first token.
+# A first token that opens the answer followed by garbage is a 200 with wrong
+# content - the one thing this check exists to catch.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"top_token":" ch",
+          "probe_content":" ch qq zz","alt_tokens":[" banana"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "does not complete the repeated pattern" \
+            "a prefix token followed by garbage is caught"
+
+# And one character is not evidence of anything, however the rest is spelled.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"top_token":" c",
+          "probe_content":" c","alt_tokens":[" banana"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "does not complete the repeated pattern" \
+            "a single character is not accepted as opening the answer"
+
+# The assembled text is what passes: four tokens that stop part-way through the
+# word are the tokenizer's boundaries, not a wrong answer.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"top_token":" c",
+          "probe_content":" cherr","alt_tokens":[" banana"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "starts the repeated pattern" "a part-way spelling of the answer passes"
+
+# Model text is where newlines come from, and the PROBE_* block is read a line
+# at a time. A newline inside a value used to end its quoting mid-value: the
+# rest of the block was swallowed into the open quote, the fields after it were
+# lost, and a fragment of the model's own token was run as a command.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
+          "top_token":" cher\nry","alt_tokens":[" banana"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "token distribution is well formed" "a newline in the token does not break the probe"
+assert_fail "$OUT" "does not complete the repeated pattern" "and the continuation is still judged"
+assert_contains "$OUT" "got 'cher ry'" "the token is reported on one line"
+assert_not_contains "$OUT" "PROBE_" "no field name leaks into the report"
+
+# The same for the assembled text, which is the field the continuation is
+# judged on: losing it silently demotes the check to its first-token fallback.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,"top_token":" ch",
+          "probe_content":" cherry\napple","alt_tokens":[" banana"," a"," __"," the"]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "completes the repeated pattern" "a newline in the reply keeps the whole answer readable"
 
 # Two identical greedy requests over an uncached prompt must agree bit for bit.
 # They do on this board - measured to the last digit of the log-probability -

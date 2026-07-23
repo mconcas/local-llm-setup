@@ -189,6 +189,14 @@ finite = (emitted_lp is not None and math.isfinite(emitted_lp) and emitted_lp <=
 ordered = finite and all(vals[i] >= vals[i + 1] - 1e-9 for i in range(len(vals) - 1))
 emitted = first.get("token") or ""
 top = tops[0].get("token") or ""
+
+def q(s):
+    # The caller filters this output a line at a time, so a value has to be one
+    # line before it is quoted: shlex.quote renders a newline inside the quotes
+    # and the filter would keep only the opening half of it. Model text is
+    # exactly where newlines come from, which is the case this section targets.
+    return shlex.quote(s.replace("\r", " ").replace("\n", " "))
+
 out = [
     "PROBE_FINITE=%d" % finite,
     "PROBE_ORDERED=%d" % ordered,
@@ -198,14 +206,14 @@ out = [
     # Micro-units, so the determinism comparison is integer equality in bash
     # rather than a float compare that would need a tolerance nothing measured.
     "PROBE_LOGPROB_U=%d" % (round(emitted_lp * 1000000) if finite else 0),
-    "PROBE_EMITTED=%s" % shlex.quote(emitted.strip()),
-    "PROBE_TOP=%s" % shlex.quote(top.strip()),
+    "PROBE_EMITTED=%s" % q(emitted.strip()),
+    "PROBE_TOP=%s" % q(top.strip()),
     # Unstripped, for the argmax failure message: a mismatch that is leading
     # whitespace only - a plausible detokenisation defect - reads as "emitted
     # 'cherry', but the top alternative is 'cherry'" once both are stripped.
-    "PROBE_EMITTED_RAW=%s" % shlex.quote(emitted),
-    "PROBE_TOP_RAW=%s" % shlex.quote(top),
-    "PROBE_CONTENT=%s" % shlex.quote(str(d.get("content", "")).strip()),
+    "PROBE_EMITTED_RAW=%s" % q(emitted),
+    "PROBE_TOP_RAW=%s" % q(top),
+    "PROBE_CONTENT=%s" % q(str(d.get("content", "")).strip()),
 ]
 print("\n".join(out))
 ' "$body"
@@ -1074,13 +1082,19 @@ runtime() {
     fi
 
     local cont_l="${PROBE_CONTENT,,}" tok_l="${PROBE_EMITTED,,}"
+    # Whatever the ${PROBE_PREDICT} tokens assembled into, falling back to the
+    # first token only for a build that reports no content at all.
+    local said="${cont_l:-$tok_l}"
     if [[ "$cont_l" == "${PROBE_EXPECT}"* || "$tok_l" == "${PROBE_EXPECT}"* ]]; then
       ok "the greedy continuation completes the repeated pattern ('${PROBE_EXPECT}')"
-    elif [[ -n "$tok_l" && "${PROBE_EXPECT}" == "$tok_l"* ]]; then
-      # A vocabulary that has no whole-word " cherry" token emits a subword of
-      # it first. That is the pattern being completed, not a model failing the
-      # probe, so it passes on the prefix rather than on the whole word.
-      ok "the greedy continuation starts the repeated pattern ('${PROBE_EMITTED}' opens '${PROBE_EXPECT}')"
+    elif [[ ${#said} -ge 2 && "${PROBE_EXPECT}" == "$said"* ]]; then
+      # A vocabulary that has no whole-word " cherry" token spells it in
+      # subwords, so ${PROBE_PREDICT} tokens can stop part-way through it. That
+      # is the pattern being completed and has to pass - but on everything the
+      # model said being a prefix of the answer, not on its first token being
+      # one. Judging the first token alone passed " c" followed by any garbage,
+      # and one character is not evidence of anything.
+      ok "the greedy continuation starts the repeated pattern ('${said}' opens '${PROBE_EXPECT}')"
     else
       no "the greedy continuation does not complete the repeated pattern" \
          "expected '${PROBE_EXPECT}', got '${PROBE_EMITTED:-${PROBE_CONTENT}}'" \
