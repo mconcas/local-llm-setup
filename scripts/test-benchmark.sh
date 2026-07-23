@@ -368,6 +368,104 @@ run_bench --base "$BASE" -r 1 -n 8
 expect_rc 0 "run without nvpmodel"
 expect_not_out 'Power mode'
 
+# ── The mode is only half the condition ───────────────────────────
+# A run at 15W on a board that offers MAXN_SUPER is a stable measurement of
+# less than the hardware can do, and the old header - which printed whatever
+# nvpmodel -q said and nothing else - could not be told apart from the board's
+# best. Same defect shape as every other one this script has had: a report that
+# is true and still leaves the reader with the wrong conclusion.
+#
+# Switching modes needs root, so neither state is reachable on the host running
+# this. The sysroot supplies both files lib/power.sh reads.
+make_nvpmodel() {  # make_nvpmodel <sysroot> <active id>
+  local d="$1"
+  mkdir -p "$d/etc" "$d/var/lib/nvpmodel"
+  printf 'pmode:%04d\n' "$2" >"$d/var/lib/nvpmodel/status"
+  cat >"$d/etc/nvpmodel.conf" <<'EOF'
+< POWER_MODEL ID=0 NAME=15W >
+CPU_ONLINE CORE_0 1
+GPU MAX_FREQ 612000000
+EMC MAX_FREQ 2133000000
+
+< POWER_MODEL ID=1 NAME=25W >
+CPU_ONLINE CORE_0 1
+GPU MAX_FREQ 918000000
+EMC MAX_FREQ 3199000000
+
+< POWER_MODEL ID=2 NAME=MAXN_SUPER >
+CPU_ONLINE CORE_0 1
+GPU MAX_FREQ -1
+EMC MAX_FREQ -1
+
+< PM_CONFIG DEFAULT=1 >
+EOF
+}
+mkdir -p "$TMPROOT/pm-capped" "$TMPROOT/pm-best"
+make_nvpmodel "$TMPROOT/pm-capped" 0
+make_nvpmodel "$TMPROOT/pm-best"   2
+
+case_start "a run below the board's fastest mode says so"
+start_stub ok
+BENCH_SYSROOT="$TMPROOT/pm-capped" run_bench --base "$BASE" -r 1 -n 8 \
+  --json "$TMPROOT/capped.json"
+expect_rc 0 "capped run still succeeds"
+expect_out 'Power mode : 15W \(not the fastest - MAXN_SUPER is available\)'
+expect_out 'This is not the fastest this board can go'
+expect_out 'sudo nvpmodel -m 2'
+if python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d['power_mode']=='15W', d['power_mode']
+assert d['power_mode_id']=='0', d['power_mode_id']
+assert d['power_best_mode']=='MAXN_SUPER', d['power_best_mode']
+assert d['power_is_best'] is False, d['power_is_best']
+# A capped board is not an unstable one - these are separate statements, and
+# collapsing them is what made 'check the power mode' unactionable advice.
+assert d['warnings']==[], d['warnings']
+" "$TMPROOT/capped.json" 2>"$TMPROOT/perr"; then
+  pass "the results file records the mode and that it was not the best"
+else
+  fail "power mode not recorded" "$(cat "$TMPROOT/perr")"
+fi
+
+case_start "a run in the board's fastest mode is not nagged"
+start_stub ok
+BENCH_SYSROOT="$TMPROOT/pm-best" run_bench --base "$BASE" -r 1 -n 8 \
+  --json "$TMPROOT/best.json"
+expect_rc 0 "uncapped run succeeds"
+expect_out 'Power mode : MAXN_SUPER \(the fastest this board offers\)'
+expect_not_out 'not the fastest this board can go'
+expect_not_out 'sudo nvpmodel -m'
+if python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d['power_mode']=='MAXN_SUPER', d['power_mode']
+assert d['power_is_best'] is True, d['power_is_best']
+assert d['power_best_mode']=='MAXN_SUPER', d['power_best_mode']
+" "$TMPROOT/best.json" 2>"$TMPROOT/berr"; then
+  pass "the results file records the run as the board's best"
+else
+  fail "best-mode run mis-recorded" "$(cat "$TMPROOT/berr")"
+fi
+
+case_start "a host with no power modes records them as absent"
+start_stub ok
+run_bench --base "$BASE" -r 1 -n 8 --json "$TMPROOT/nopm.json"
+expect_rc 0 "run on a host without nvpmodel"
+if python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d['power_mode'] is None, d['power_mode']
+assert d['power_best_mode'] is None, d['power_best_mode']
+# Neither True nor False: nothing was established, and recording False here
+# would read as 'this board was throttled' in every comparison made later.
+assert d['power_is_best'] is None, d['power_is_best']
+" "$TMPROOT/nopm.json" 2>"$TMPROOT/nperr"; then
+  pass "absent power modes are recorded as unknown, not as 'not the best'"
+else
+  fail "absent power modes mis-recorded" "$(cat "$TMPROOT/nperr")"
+fi
+
 # ── Steadiness ────────────────────────────────────────────────────
 # The defect this replaces: the table showed one median per case, so a board
 # that fell from 28 to 4 tok/s while the sweep ran produced a plausible-looking

@@ -27,6 +27,12 @@
 #   REC_CTX_SIZE       recommended context window
 #   REC_PARALLEL       recommended concurrent request slots
 #   REC_CACHE_TYPE     recommended KV cache quantisation
+#   POWER_STATE        Jetson only: best | below | unknown-mode | ... (lib/power.sh)
+#   POWER_ACTIVE_ID    the nvpmodel power mode the board is running in
+#   POWER_ACTIVE_NAME
+#   POWER_BEST_ID      the fastest mode the board's nvpmodel.conf offers
+#   POWER_BEST_NAME
+#   POWER_DEFAULT_ID   the mode nvpmodel.conf declares as the boot default
 set -euo pipefail
 
 EMIT_ENV=0
@@ -200,6 +206,14 @@ else
   REC_MODEL_PCT=0
 fi
 
+# ── Power mode ────────────────────────────────────────────────────
+# A Jetson's nvpmodel cap decides most of the throughput the board has, and
+# nothing in this stack was reporting whether the active cap is the best one on
+# offer. Reads plain files under SYSROOT, so it is testable and needs no root.
+# shellcheck source=lib/power.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/power.sh"
+power_probe "$SYSROOT"
+
 # ── Output ────────────────────────────────────────────────────────
 if (( EMIT_ENV )); then
   cat <<EOF
@@ -219,6 +233,12 @@ REC_CTX_SIZE=$REC_CTX_SIZE
 REC_PARALLEL=$REC_PARALLEL
 REC_CACHE_TYPE=$REC_CACHE_TYPE
 REC_MODEL_PCT=$REC_MODEL_PCT
+POWER_STATE=$POWER_STATE
+POWER_ACTIVE_ID=$POWER_ACTIVE_ID
+POWER_ACTIVE_NAME="$POWER_ACTIVE_NAME"
+POWER_BEST_ID=$POWER_BEST_ID
+POWER_BEST_NAME="$POWER_BEST_NAME"
+POWER_DEFAULT_ID=$POWER_DEFAULT_ID
 EOF
   exit 0
 fi
@@ -233,6 +253,13 @@ if [[ "$PLATFORM_KIND" == "jetson" ]]; then
   echo "  Model budget  : $((GPU_MEM_MB / 1024)) GiB (unified memory, minus OS reserve)"
 else
   echo "  Model budget  : $((GPU_MEM_MB / 1024)) GiB"
+fi
+if [[ "$POWER_STATE" != "unavailable" ]]; then
+  echo "  Power mode    : ${POWER_ACTIVE_NAME:-unknown}$([[ -n "$POWER_ACTIVE_ID" ]] && echo " (id $POWER_ACTIVE_ID)")"
+  case "$POWER_STATE" in
+    best)  echo "                  this is the fastest mode this board offers" ;;
+    below) echo "                  fastest available: $POWER_BEST_NAME (id $POWER_BEST_ID)" ;;
+  esac
 fi
 echo ""
 echo "Container"
@@ -261,6 +288,15 @@ elif (( GPU_MEM_MB > 0 && REC_MODEL_PCT > 60 )); then
   echo "WARNING: even the smallest supported model takes ${REC_MODEL_PCT}% of this board's"
   echo "         ${GPU_MEM_MB} MiB budget, leaving little for the KV cache. Expect to"
   echo "         lower CTX_SIZE below $REC_CTX_SIZE, or run this stack on a larger board."
+fi
+
+if [[ "$POWER_STATE" == "below" ]]; then
+  # Not a warning about a broken configuration - the stack runs fine here. It
+  # is a warning that the numbers this board produces are not the ones it can
+  # produce, which on a bandwidth-bound workload is most of the difference.
+  echo ""
+  echo "NOTE: this board is in its $POWER_ACTIVE_NAME power mode, which is not its fastest."
+  while IFS= read -r _line; do echo "      $_line"; done < <(power_advice_lines)
 fi
 
 if [[ "$PLATFORM_KIND" == "jetson" && "$GPU_ACCESS" == "none" ]]; then

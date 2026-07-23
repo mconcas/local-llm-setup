@@ -80,6 +80,7 @@ docker compose up -d
 ./scripts/test-compose.sh                     # deployment configuration self-test
 ./scripts/test-env-lib.sh                     # configuration reader self-test
 ./scripts/test-mem.sh                         # memory sizing self-test
+./scripts/test-power.sh                       # power mode self-test
 ./scripts/test-benchmark.sh                   # benchmark self-test
 ./scripts/test-setup.sh                       # bootstrap self-test
 ./scripts/test-download-model.sh              # model acquisition self-test
@@ -89,10 +90,10 @@ docker compose up -d
 ```
 
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
-merge, model sizing, disk hygiene, container health, full GPU layer offload, the
-OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
-rejects clients which do not trust the CA). It is **50 checks, all green** on a
-Jetson Orin Nano Super with the stack up.
+merge, model sizing, the board's power mode, disk hygiene, container health,
+full GPU layer offload, the OpenAI endpoints, streaming, tool calling, and the
+TLS proxy (including that it rejects clients which do not trust the CA). It is
+**52 checks, all green** on a Jetson Orin Nano Super with the stack up.
 
 Every self-test above also runs as a preflight check, so `./scripts/validate.sh`
 alone exercises all of them. `VALIDATE_SELFTESTS=0` skips them when you only
@@ -114,7 +115,7 @@ with the conditions it was taken under, so the run reports them:
 
 | Column / line  | What it tells you                                                             |
 |----------------|-------------------------------------------------------------------------------|
-| `Power mode`   | Read from `nvpmodel`. A 15 W figure is not comparable to a 25 W/MAXN one.      |
+| `Power mode`   | The active nvpmodel mode **and whether it is the fastest the board offers**. A 15 W figure is not comparable to a MAXN_SUPER one, and the mode name alone does not say which you have. See [Power mode](#power-mode-is-the-board-allowed-to-go-this-fast). |
 | `spread`       | `(max-min)/median` of generation throughput across the repetitions of one case. A single median cannot distinguish a steady 12 tok/s from a run that started at 16 and ended at 8. |
 | `Steady state` | The *first* case re-measured once after the sweep. The sweep walks from a short prompt to a long one, so throughput falling down the table says nothing about the board; re-running the same prompt at the end compares like with like, and any drop is the machine. |
 | `Thermal`      | Every readable sysfs zone, start of run → end of run, including `tj-thermal` (the junction temperature that governs throttling on an Orin). |
@@ -143,6 +144,85 @@ Thermal tj-thermal     51°C -> 58°C
 mode, the start and end temperature of each zone, the trip point and any
 warnings - so two runs can be compared on their conditions and not just on their
 medians.
+
+### Power mode: is the board allowed to go this fast?
+
+A Jetson ships power-capped, and on these boards the cap is the single biggest
+lever on throughput. An Orin Nano Super boots into **15 W**, where the memory
+controller is limited to 2133 MHz; `MAXN_SUPER` removes the cap entirely. Token
+generation is memory-bandwidth bound, so that is not a marginal difference - it
+is most of the performance the board has.
+
+The run conditions used to report the mode and stop there, which is the same
+defect shape as everything else this repo has fixed: the statement was true and
+still left the wrong conclusion available. `nvpmodel -q` says what the board is
+set to and nothing about what else it offers, so `15W` and the board's best were
+indistinguishable in a results file.
+
+`lib/power.sh` reads both halves, from two plain files, with no root and no
+`nvpmodel` binary needed:
+
+| File | What it gives |
+|------|---------------|
+| `/var/lib/nvpmodel/status` | the active mode, as `pmode:0000` - this is what `nvpmodel` itself writes |
+| `/etc/nvpmodel.conf`       | the catalogue: every mode's EMC, GPU, CPU and core ceilings, and the boot default |
+
+**The fastest mode is not the highest id.** On an Orin Nano Super the ids are
+`15W=0`, `25W=1`, `MAXN_SUPER=2`, `7W=3`, so both "highest id" and "last block in
+the file" name the *slowest* mode on the board. Modes are ranked by what they
+actually uncap, in the order that decides inference throughput: EMC (memory
+bandwidth, which sets generation speed), then the GPU clock (prompt processing),
+then online cores and CPU clock. `-1` in the configuration means "no cap" and
+ranks above any number.
+
+So `validate.sh` reports the mode you are in *and* the one you could be in:
+
+```
+PASS  power mode is 15W (id 0): EMC 2133 MHz, GPU 612 MHz, 6 core(s)
+      MAXN_SUPER is faster: it removes the caps this mode applies (EMC 2133 MHz, GPU 612 MHz)
+      switch with: sudo nvpmodel -m 2   (persists across reboots)
+```
+
+A capped board is not a broken one, so that is a PASS with advice, and
+`benchmark.sh` prints the same thing next to its numbers. What *does* fail is a
+board reporting a mode its own `/etc/nvpmodel.conf` does not define - there,
+neither this check nor `nvpmodel` knows what the hardware is doing.
+
+Where the faster mode states real ceilings rather than uncapping, the advice
+quotes the ratio those numbers imply:
+
+```
+25W is faster: EMC 2133 MHz -> 3199 MHz (49% more memory bandwidth, which is
+what generation speed follows), GPU 612 MHz -> 918 MHz
+```
+
+Where it is uncapped there is no honest figure to quote, so it says what the
+mode removes instead of inventing a speedup.
+
+`--json` records `power_mode`, `power_mode_id`, `power_best_mode` and
+`power_is_best`, deliberately as separate fields from the throttling warnings:
+"this run was not stable" and "this run was stable, at less than the board can
+do" are different statements, and collapsing them is how `check the power mode`
+stayed advice nobody could act on.
+
+### Power mode self-test
+
+A board sits in exactly one mode and switching it needs root, so the host these
+tests run on can demonstrate almost none of what the reader has to get right.
+`test-power.sh` drives `lib/power.sh` against synthetic `nvpmodel.conf` and
+`status` trees: the Orin Nano Super catalogue whose fastest mode is not its
+highest id, an uncapped mode against a capped one, two ceilings past `INT32_MAX`
+(awk's `%d` clamps there - 3199000000 came back as 2147483647, which made
+genuinely different modes compare equal), identical modes, a status file naming a
+mode the configuration does not define, a configuration with no modes at all, a
+freshly flashed board with no status file, a failing `nvpmodel` binary, and a
+Xavier-style configuration with different mode names and a different CPU cluster
+keyword.
+
+One case is differential rather than synthetic: where the host really is a
+Jetson, the value read from the files is compared against what `nvpmodel -q`
+itself reports. Reading the files is a shortcut, and a shortcut is only safe
+while it still gives the same answer as the thing it replaced.
 
 ### Platform detection self-test
 
@@ -640,13 +720,22 @@ comfortable room for a 16k context. Measured with `benchmark.sh`:
 |------------------------------|-----------|-------------|------------|
 | Qwen2.5-3B-Instruct Q4_K_M   | 15 W      | ~500 tok/s  | ~14 tok/s  |
 
-Generation is bandwidth bound, so it barely moves with prompt length. The Orin
-Nano *Super* also has a 25 W mode, which is not the default and is worth
-enabling before benchmarking:
+Generation is bandwidth bound, so it barely moves with prompt length - and for
+the same reason it moves a great deal with the power mode, because that is what
+caps the memory controller. **The figures above were taken in the board's
+shipping 15 W mode, which is not its fastest.** An Orin Nano Super also offers
+25 W (EMC 3199 MHz, 49% more bandwidth) and `MAXN_SUPER` (uncapped):
 
 ```bash
-sudo nvpmodel -m 2 && sudo jetson_clocks   # check `sudo nvpmodel -q` for the mode list
+sudo nvpmodel -q                     # the mode list, and which one is active
+sudo nvpmodel -m 2                   # MAXN_SUPER on an Orin Nano Super
+sudo jetson_clocks                   # optional: pin clocks to the mode's ceiling
 ```
+
+Mode **ids differ between boards** - `-m 2` is `MAXN_SUPER` here and something
+else elsewhere - so take the id from `nvpmodel -q`, or from `validate.sh` and
+`benchmark.sh`, both of which read the board's own catalogue and name the id to
+use. See [Power mode](#power-mode-is-the-board-allowed-to-go-this-fast).
 
 ## Configuration
 
@@ -850,6 +939,7 @@ TLS stack will accept. It needs no GPU, Docker, model or network, and
 │   ├── lib/
 │   │   ├── env.sh              # Reading .env with compose's semantics
 │   │   ├── mem.sh              # KV cache and footprint arithmetic
+│   │   ├── power.sh            # nvpmodel power modes and which one is fastest
 │   │   └── gguf.py             # GGUF metadata reader (layers, heads, vocab)
 │   ├── test-fixtures/
 │   │   └── mkgguf.py           # Builds sparse GGUF files for the tests
@@ -866,6 +956,7 @@ TLS stack will accept. It needs no GPU, Docker, model or network, and
 │   ├── test-compose.sh         # Hermetic tests for the compose files + nginx.conf
 │   ├── test-env-lib.sh         # Hermetic tests for the .env reader (vs compose)
 │   ├── test-mem.sh             # Hermetic tests for the memory sizing
+│   ├── test-power.sh           # Hermetic tests for the power-mode reader
 │   ├── benchmark.sh            # Throughput benchmark
 │   └── test-benchmark.sh       # Hermetic tests for the benchmark
 ├── models/                     # GGUF model files (git-ignored)

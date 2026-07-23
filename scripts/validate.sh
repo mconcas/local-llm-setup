@@ -72,6 +72,7 @@ head() { printf '\n%s%s%s\n' "$C_HD" "$1" "$C_Z"; }
 ENV_FILE="$PROJECT_DIR/.env"
 . "$SCRIPT_DIR/lib/env.sh"
 . "$SCRIPT_DIR/lib/mem.sh"
+. "$SCRIPT_DIR/lib/power.sh"
 ENV_PROJECT_DIR="$PROJECT_DIR"   # compose resolves a relative bind source against this
 env_load
 
@@ -201,6 +202,36 @@ preflight() {
   else
     skip "no GPU memory budget (CPU-only host)"
   fi
+
+  # The nvpmodel cap decides most of the throughput a Jetson has, and it is the
+  # one condition of the deployment that nothing here used to report: an Orin
+  # Nano Super boots in 15W, where the memory controller runs at 2133 MHz
+  # against MAXN_SUPER's uncapped, and generation speed follows that number.
+  # A capped board is not a broken one, so it passes - but it passes saying so.
+  # What does fail is a board running a mode its own nvpmodel.conf does not
+  # define, because then neither this check nor nvpmodel knows what it is doing.
+  power_probe "${PLATFORM_SYSROOT:-}"
+  case "$POWER_STATE" in
+    unavailable)
+      if [[ "${PLATFORM_KIND:-}" == "jetson" ]]; then
+        skip "no readable /etc/nvpmodel.conf - cannot tell which power modes this board offers"
+      else
+        skip "power modes are a Jetson concept (platform is ${PLATFORM_KIND:-unknown})"
+      fi ;;
+    no-modes)
+      no "/etc/nvpmodel.conf defines no power modes" \
+         "nvpmodel cannot switch modes against this file either" ;;
+    unknown-mode)
+      no "the board reports power mode '${POWER_ACTIVE_ID:-none}', which /etc/nvpmodel.conf does not define" \
+         "the configuration was replaced without a reboot, or the status file is stale" \
+         "check: sudo nvpmodel -q   and the mode list in /etc/nvpmodel.conf" ;;
+    best)
+      ok "power mode is $(power_describe "$POWER_ACTIVE_ID") - the fastest this board offers" ;;
+    below)
+      # ok() prints every argument after the first as an advice line.
+      mapfile -t _pw_advice < <(power_advice_lines)
+      ok "power mode is $(power_describe "$POWER_ACTIVE_ID")" "${_pw_advice[@]}" ;;
+  esac
 
   # Detection takes exactly one branch on any given host, so this machine can
   # never exercise the other boards' paths. The self-test drives the same script
@@ -574,6 +605,15 @@ preflight() {
   # the runtime check compares the same arithmetic against what llama.cpp
   # actually allocated.
   selftest test-mem.sh "memory sizing"
+
+  head "Preflight - power mode"
+
+  # This board sits in exactly one mode, and switching it needs root, so the
+  # host can demonstrate neither the ranking nor the states that matter: a
+  # catalogue whose fastest mode is not its highest id, an uncapped mode against
+  # a capped one, a status file naming a mode the configuration does not define.
+  # The self-test drives the same reader against synthetic nvpmodel trees.
+  selftest test-power.sh "power mode"
 
   head "Preflight - benchmark"
 

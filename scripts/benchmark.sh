@@ -111,12 +111,24 @@ echo "Slots      : ${PARALLEL:-?}"
 # The Jetson's power mode caps clocks and is the single biggest lever on these
 # numbers, so record it alongside the results - a 15W figure is not comparable
 # to a 25W/MAXN one.
-NVPMODEL_BIN="${BENCH_NVPMODEL:-nvpmodel}"
-POWER_MODE=""
-if command -v "$NVPMODEL_BIN" &>/dev/null; then
-  POWER_MODE="$("$NVPMODEL_BIN" -q 2>/dev/null \
-    | grep -i 'power mode' | sed 's/.*: *//' | head -1)"
-  [[ -n "$POWER_MODE" ]] && echo "Power mode : $POWER_MODE"
+#
+# Reporting the mode alone was still half the story, and it is the same shape as
+# every other defect this script has had: a run at 15W on a board that offers
+# MAXN_SUPER is a measurement of less than the hardware can do, and the old
+# header could not distinguish it from the board's best. lib/power.sh reads the
+# catalogue too, so the run states which mode it took and whether that was the
+# fastest one available.
+POWER_NVPMODEL="${BENCH_NVPMODEL:-nvpmodel}"
+# shellcheck source=lib/power.sh
+. "$SCRIPT_DIR/lib/power.sh"
+power_probe "${BENCH_SYSROOT:-}"
+POWER_MODE="$POWER_ACTIVE_NAME"
+if [[ -n "$POWER_MODE" ]]; then
+  case "$POWER_STATE" in
+    best)  echo "Power mode : $POWER_MODE (the fastest this board offers)" ;;
+    below) echo "Power mode : $POWER_MODE (not the fastest - $POWER_BEST_NAME is available)" ;;
+    *)     echo "Power mode : $POWER_MODE" ;;
+  esac
 fi
 echo "Reps       : $REPS per case, $GEN_TOKENS tokens generated"
 echo ""
@@ -406,7 +418,18 @@ if (( ${#WARNINGS[@]} > 0 )); then
   for msg in "${WARNINGS[@]}"; do
     echo "! These numbers are not comparable: $msg."
   done
-  echo "  Let the board settle (and check the power mode) before comparing runs."
+  echo "  Let the board settle before comparing runs."
+fi
+
+# Separate from the warnings above, and deliberately so: those say the run is
+# not a stable measurement, this says the run is a stable measurement of a board
+# that was not allowed to go as fast as it can. Both can be true, and treating
+# them as one message is how "check the power mode" stayed advice nobody could
+# act on - it never said which mode, or what the alternative was.
+if [[ "$POWER_STATE" == "below" ]]; then
+  echo ""
+  echo "! This is not the fastest this board can go: it ran in $POWER_ACTIVE_NAME."
+  while IFS= read -r _line; do echo "  $_line"; done < <(power_advice_lines)
 fi
 
 if [[ -n "$JSON_OUT" ]]; then
@@ -427,7 +450,13 @@ out = {
   'ctx_size':     sys.argv[6],
   'kv_cache':     {'k': sys.argv[7], 'v': sys.argv[8]},
   'parallel':     sys.argv[9],
+  # The mode alone does not say whether it was the board's best, and comparing
+  # two results files is exactly where that matters: 13.6 tok/s at 15W and
+  # 13.6 tok/s at MAXN_SUPER are the same number about very different boards.
   'power_mode':   sys.argv[10] or None,
+  'power_mode_id':   sys.argv[21] or None,
+  'power_best_mode': sys.argv[22] or None,
+  'power_is_best':   {'best': True, 'below': False}.get(sys.argv[23]),
   'gen_tokens':   int(sys.argv[11]),
   'reps':         int(sys.argv[12]),
   'failed_reps':  int(sys.argv[13]),
@@ -445,7 +474,8 @@ print(json.dumps(out, indent=2))
     "${PARALLEL:-}" "$POWER_MODE" "$GEN_TOKENS" "$REPS" "$LOST_REPS" \
     "$FIRST_LABEL" "$STEADY_TG" "$STEADY_DROP" \
     "$THERMAL_START" "$THERMAL_END" "$PASSIVE_TRIP" \
-    "$(printf '%s\n' "${WARNINGS[@]+"${WARNINGS[@]}"}")" > "$JSON_OUT"
+    "$(printf '%s\n' "${WARNINGS[@]+"${WARNINGS[@]}"}")" \
+    "$POWER_ACTIVE_ID" "$POWER_BEST_NAME" "$POWER_STATE" > "$JSON_OUT"
   echo ""
   if [[ -s "$JSON_OUT" ]]; then
     echo "Wrote $JSON_OUT"

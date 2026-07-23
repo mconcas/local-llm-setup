@@ -280,6 +280,42 @@ make_jetson_sysroot() {   # $1=dir  $2=MemTotal kB  [$3=no-cdi]
     mkdir -p "$d/etc/cdi"
     printf 'cdiVersion: "0.5.0"\nkind: "nvidia.com/gpu"\n' >"$d/etc/cdi/nvidia.yaml"
   fi
+  make_nvpmodel "$d" 0
+}
+
+# The two files lib/power.sh reads. Without them the fixture inherits whatever
+# nvpmodel binary happens to be on the host's PATH, so the power-mode check
+# would report a different thing on a Jetson than on a developer machine.
+# Mode 0 (15W) is the board's shipping default and not its fastest, which is
+# the state the check exists to report.
+make_nvpmodel() {   # $1=sysroot  $2=active mode id
+  local d="$1"
+  mkdir -p "$d/etc" "$d/var/lib/nvpmodel"
+  printf 'pmode:%04d\n' "$2" >"$d/var/lib/nvpmodel/status"
+  cat >"$d/etc/nvpmodel.conf" <<'EOF'
+< PARAM TYPE=CLOCK NAME=EMC >
+MAX_FREQ /sys/kernel/nvpmodel_emc_cap/emc_iso_cap
+
+< POWER_MODEL ID=0 NAME=15W >
+CPU_ONLINE CORE_0 1
+CPU_A78_0 MAX_FREQ 1497600
+GPU MAX_FREQ 612000000
+EMC MAX_FREQ 2133000000
+
+< POWER_MODEL ID=1 NAME=25W >
+CPU_ONLINE CORE_0 1
+CPU_A78_0 MAX_FREQ 1344000
+GPU MAX_FREQ 918000000
+EMC MAX_FREQ 3199000000
+
+< POWER_MODEL ID=2 NAME=MAXN_SUPER >
+CPU_ONLINE CORE_0 1
+CPU_A78_0 MAX_FREQ -1
+GPU MAX_FREQ -1
+EMC MAX_FREQ -1
+
+< PM_CONFIG DEFAULT=1 >
+EOF
 }
 make_x86_sysroot() { mkdir -p "$1/proc" "$1/etc"; printf 'MemTotal:       %s kB\n' "$2" >"$1/proc/meminfo"; }
 
@@ -459,6 +495,51 @@ assert_not_contains "$OUT" "unbound variable" "does not die on set -u"
 assert_contains "$OUT" "Preflight - disk hygiene" "reaches the section after it"
 assert_contains "$OUT" "Summary" "still prints the summary"
 assert_contains "$OUT" "Failed checks:" "lists the failure"
+
+# ══════════════════════════════════════════════════════════════════
+case_start "The power mode is reported, and a mode nobody defined is a failure"
+# ══════════════════════════════════════════════════════════════════
+# The board this runs on sits in one mode and switching it needs root, so none
+# of these states are reachable here without the fixture. The check has to be
+# able to go red or it is the vacuous-pass shape this whole suite exists for:
+# a stale status file naming a mode /etc/nvpmodel.conf does not define is the
+# state where neither the check nor nvpmodel itself knows what the board is
+# doing, and it is the one that fails.
+new_project; healthy_env "$P"
+run_jetson "$P" --preflight
+assert_exit "$RC" 0 "a capped board is not a failure"
+assert_pass "$OUT" "power mode is 15W (id 0)" "reports the active mode"
+assert_contains "$OUT" "MAXN_SUPER is faster" "names the faster mode"
+assert_contains "$OUT" "sudo nvpmodel -m 2" "gives the exact command"
+
+PM_BEST="$TMPROOT/sys-jetson-maxn"; make_jetson_sysroot "$PM_BEST" 7620000
+make_nvpmodel "$PM_BEST" 2
+new_project; healthy_env "$P"
+run_validate "$P" "$PM_BEST" "$NO_SMI" --preflight
+assert_exit "$RC" 0 "a board in its fastest mode passes"
+assert_pass "$OUT" "power mode is MAXN_SUPER (id 2)" "reports the fastest mode"
+assert_not_contains "$OUT" "sudo nvpmodel -m" "and offers no advice it does not need"
+
+PM_STALE="$TMPROOT/sys-jetson-stale"; make_jetson_sysroot "$PM_STALE" 7620000
+make_nvpmodel "$PM_STALE" 9      # a mode the catalogue above does not define
+new_project; healthy_env "$P"
+run_validate "$P" "$PM_STALE" "$NO_SMI" --preflight
+assert_exit "$RC" 1 "an undefined mode fails the run"
+assert_fail "$OUT" "which /etc/nvpmodel.conf does not define" "reports the undefined mode"
+assert_contains "$OUT" "power mode '9'" "names the mode the board reported"
+assert_contains "$OUT" "Summary" "still completes the run"
+
+PM_NONE="$TMPROOT/sys-jetson-nopm"; make_jetson_sysroot "$PM_NONE" 7620000
+rm -f "$PM_NONE/etc/nvpmodel.conf" "$PM_NONE/var/lib/nvpmodel/status"
+new_project; healthy_env "$P"
+run_validate "$P" "$PM_NONE" "$NO_SMI" --preflight
+assert_exit "$RC" 0 "a Jetson without nvpmodel.conf is not a failure"
+assert_skip "$OUT" "cannot tell which power modes this board offers" "skips with its reason"
+
+new_project; healthy_env "$P" "COMPOSE_FILE=docker-compose.yml" "LLAMA_IMAGE=$X86_IMAGE"
+printf '%s' "$CFG_LEGACY" >"$P/.dockerstub/config.out"
+run_validate "$P" "$X86_SYSROOT" "$DISCRETE_SMI" --preflight
+assert_skip "$OUT" "power modes are a Jetson concept" "skips on a discrete-GPU host"
 
 # ══════════════════════════════════════════════════════════════════
 case_start "An .env saved with CRLF endings is read as compose reads it"
