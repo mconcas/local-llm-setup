@@ -62,6 +62,13 @@ import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MODE, PORTFILE, LOGFILE = sys.argv[1], sys.argv[2], sys.argv[3]
+# Optional: a real GGUF to serve as the body, and a size to advertise for it.
+# The fit preflight reads the model's own metadata, so the cases that exercise
+# it need a body with real geometry rather than the filler below - and a size
+# claim of its own, because a model large enough to refuse is one this board
+# has no business actually holding.
+BODYFILE = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else ""
+ADV_OVERRIDE = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else 0
 
 # A small but structurally honest GGUF: the magic the script checks, then
 # filler. Real weights are gigabytes; nothing here needs to be.
@@ -75,8 +82,13 @@ HTML = b"<!DOCTYPE html><html><body>Sign in to access this repository</body></ht
 #   html      - a login page served with a correct content-length
 #   cutoff    - content-length is honest, the connection dies halfway through
 #   getfails  - the size probe succeeds and the transfer itself is refused
-BODY = HTML if MODE == "html" else GGUF
-ADVERTISED = {
+#   norange   - Range is ignored and the whole object is sent, which is what
+#               turns a header probe into the download it meant to avoid
+if BODYFILE:
+    BODY = open(BODYFILE, "rb").read()
+else:
+    BODY = HTML if MODE == "html" else GGUF
+ADVERTISED = ADV_OVERRIDE or {
     "shortget": len(BODY) + 4096,
     "huge": 1 << 50,
 }.get(MODE, len(BODY))
@@ -90,7 +102,8 @@ class H(BaseHTTPRequestHandler):
 
     def _log(self):
         with open(LOGFILE, "a") as f:
-            f.write(json.dumps({"method": self.command, "path": self.path}) + "\n")
+            f.write(json.dumps({"method": self.command, "path": self.path,
+                                "range": self.headers.get("Range", "")}) + "\n")
 
     def _error(self, code, msg):
         b = msg.encode()
@@ -126,6 +139,23 @@ class H(BaseHTTPRequestHandler):
             # must not write this body to the destination.
             self._error(403, "Forbidden: request blocked")
             return
+        # A ranged GET is how the fit preflight reads the metadata block
+        # without pulling the weights. Serve it the way huggingface.co's CDN
+        # does, unless this run is modelling an endpoint that does not.
+        rng = self.headers.get("Range", "")
+        if rng.startswith("bytes=") and not head and MODE != "norange":
+            first, _, last = rng[6:].partition("-")
+            lo = int(first)
+            hi = min(int(last), len(BODY) - 1) if last else len(BODY) - 1
+            chunk = BODY[lo:hi + 1]
+            self.send_response(206)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Range",
+                             "bytes %d-%d/%d" % (lo, lo + len(chunk) - 1, ADVERTISED))
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(ADVERTISED if head else len(BODY)))
@@ -156,11 +186,12 @@ PYEOF
 STUB_LOG="$TMPROOT/requests.jsonl"
 ENDPOINT=""
 
-# start_stub <mode>
+# start_stub <mode> [body-file] [advertised-size]
 start_stub() {
   stop_stub
   rm -f "$TMPROOT/port" "$STUB_LOG"
-  python3 "$TMPROOT/stub.py" "$1" "$TMPROOT/port" "$STUB_LOG" >"$TMPROOT/stub.err" 2>&1 &
+  python3 "$TMPROOT/stub.py" "$1" "$TMPROOT/port" "$STUB_LOG" \
+          "${2:-}" "${3:-}" >"$TMPROOT/stub.err" 2>&1 &
   STUB_PID=$!
   local i
   for i in $(seq 1 100); do
@@ -218,10 +249,22 @@ _clean_path() {
 CLEAN_PATH="$(_clean_path)"
 
 # run_dl <args...> - runs the real script in the current project.
+#
+# DL_SYSROOT pins the board the fit preflight sizes against; left empty the
+# check reads the host, which makes every verdict depend on whose machine the
+# suite runs on. DL_FIT_HEADER shrinks the ranged read to the fixtures' scale.
+DL_SYSROOT=""
+DL_FIT_HEADER=""
 OUT=""; RC=0
 run_dl() {
-  OUT="$(cd "$PROJ" && PATH="$CLEAN_PATH" HF_ENDPOINT="$ENDPOINT" \
-         bash "$PROJ/scripts/download-model.sh" "$@" 2>&1)"
+  # An array through `env`, not an assignment prefix: bash decides what is a
+  # variable assignment before expanding, so ${X:+K=V} in that position would
+  # be run as the command name rather than set as K.
+  local -a e=(PATH="$CLEAN_PATH" HF_ENDPOINT="$ENDPOINT")
+  [[ -n "$DL_SYSROOT" ]] && e+=(PLATFORM_SYSROOT="$DL_SYSROOT"
+                                PLATFORM_NVIDIA_SMI=/nonexistent-in-fixture)
+  [[ -n "$DL_FIT_HEADER" ]] && e+=(FIT_HEADER_BYTES="$DL_FIT_HEADER")
+  OUT="$(cd "$PROJ" && env "${e[@]}" bash "$PROJ/scripts/download-model.sh" "$@" 2>&1)"
   RC=$?
   return 0
 }
@@ -694,6 +737,309 @@ run_dl acme/Qwen3-GGUF clishort.gguf
 expect_rc 1 "cli produced a short file"
 expect_out 'size mismatch'
 expect_no_gguf "short cli download"
+
+# ══════════════════════════════════════════════════════════════════
+printf '\n%s╔══════════════════════════════════════════════════╗%s\n' "$C_HD" "$C_Z"
+printf '%s║  Fit preflight: will it run once it is here?      ║%s\n' "$C_HD" "$C_Z"
+printf '%s╚══════════════════════════════════════════════════╝%s\n' "$C_HD" "$C_Z"
+# Free space says whether the file can land; none of it says whether the model
+# can be *served*. On a Jetson the weights, the KV cache and the compute buffers
+# share the pool the OS is using, and the cache is set by CTX_SIZE and
+# CACHE_TYPE_K/V - two knobs the file size cannot see. These cases pin that the
+# verdict comes from the model's own metadata, that it is reached before the
+# body is transferred, and that everything it cannot establish is reported as a
+# skip rather than guessed at.
+
+# A body with real geometry. Qwen2.5-3B's shape: 36 layers, 2 KV heads,
+# head_dim 128 - 9216 K elements per token, the same again for V. At q8_0 that
+# is 19584 bytes per token, so 16384 tokens cost 306 MiB and 131072 cost 2448.
+FITGGUF="$TMPROOT/fit-model.gguf"
+python3 "$SCRIPT_DIR/test-fixtures/mkgguf.py" "$FITGGUF" \
+  --arch qwen2 --layers 36 --embd 2048 --heads 16 --kv-heads 2 \
+  --ctx-train 32768 --vocab 512
+SWAGGUF="$TMPROOT/fit-swa.gguf"
+python3 "$SCRIPT_DIR/test-fixtures/mkgguf.py" "$SWAGGUF" \
+  --arch gemma2 --layers 36 --embd 2048 --heads 16 --kv-heads 2 \
+  --sliding-window 4096 --ctx-train 32768 --vocab 512
+
+FIT_BODY_BYTES="$(stat -c %s "$FITGGUF")"
+# The fixtures' Jetson: 8000000 kB of RAM is 7812 MiB, less the 2048 MiB OS
+# reserve, so every verdict below is against a 5764 MiB budget.
+FIT_SYSROOT="$(make_jetson_sysroot fit 8000000)"
+FIT_BUDGET=5764
+
+# fit_env <ctx> [type-k] [type-v] - the deployment the model will be served under.
+fit_env() {
+  printf 'MODELS_DIR=./models\nCTX_SIZE=%s\nCACHE_TYPE_K=%s\nCACHE_TYPE_V=%s\n' \
+    "$1" "${2:-q8_0}" "${3:-q8_0}" >"$PROJ/.env"
+}
+
+# Ranged GETs the stub saw. The whole promise of the preflight is that it reads
+# a header, so "it refused before downloading" has to be asserted on the wire,
+# not inferred from an empty models directory.
+ranged_gets() { grep -c '"range": "bytes=' "$STUB_LOG" 2>/dev/null || true; }
+full_gets()   { grep '"method": "GET"' "$STUB_LOG" 2>/dev/null | grep -c '"range": ""' || true; }
+
+case_start "a model too large for the board is refused before the body moves"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" $((9 * 1024 * 1024 * 1024))
+fit_env 16384
+run_dl acme/Qwen3-GGUF toobig.gguf
+expect_rc 3 "will not fit"
+expect_out 'will not fit'
+expect_out 'Once loaded.*weights 9216 .*16384-token q8_0/q8_0 KV cache 306 = 9522 MiB'
+expect_out "against a $FIT_BUDGET MiB budget"
+expect_no_gguf "refused model"
+if [[ "$(ranged_gets)" -ge 1 ]]; then pass "the metadata was read with a ranged request"
+else fail "no ranged request was issued" "$(cat "$STUB_LOG")"; fi
+if [[ "$(full_gets)" == 0 ]]; then pass "no unranged GET - the 9 GiB body never started"
+else fail "the body transfer started despite the refusal" "$(full_gets) unranged GETs"; fi
+
+case_start "the same model and board flip verdict on CTX_SIZE alone"
+# The check this replaces sized on the file, so these two configurations were
+# indistinguishable: identical weights, identical board, one that runs and one
+# that cannot. A model at 88% of the budget is exactly where that matters.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" $((5 * 1024 * 1024 * 1024))
+fit_env 131072
+run_dl acme/Qwen3-GGUF ctxdecides.gguf
+expect_rc 3 "5 GiB of weights plus a 131072-token cache does not fit"
+expect_out 'KV cache 2448'
+expect_no_gguf "refused at 131072"
+# Same everything, a context the board can hold: the transfer goes ahead.
+new_project; MODELS="$PROJ/models"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 4096
+run_dl acme/Qwen3-GGUF ctxdecides.gguf
+expect_rc 0 "the same model at 4096 tokens is fetched"
+expect_out 'Once loaded'
+if [[ -f "$MODELS/ctxdecides.gguf" ]]; then pass "the model landed"
+else fail "the fitting configuration was not downloaded" "$(tr '\n' '|' <<<"$OUT" | cut -c1-200)"; fi
+
+case_start "the cache type is part of the verdict, not just the context"
+# f16 is exactly twice q8_0, which is the whole reason the Jetson defaults are
+# quantised. A refusal that ignored CACHE_TYPE_K/V would pass both of these.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 16384 f16 f16
+run_dl acme/Qwen3-GGUF cachetype.gguf
+expect_out 'KV cache 576'
+new_project; MODELS="$PROJ/models"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 16384 q8_0 q8_0
+run_dl acme/Qwen3-GGUF cachetype.gguf
+expect_out 'KV cache 306'
+
+case_start "a refusal names a context that would fit"
+# "Lower CTX_SIZE" is advice; "CTX_SIZE=N fits" is an instruction. It has to be
+# derived from the room actually left, not picked from a table.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" $((4 * 1024 * 1024 * 1024))
+fit_env 131072
+run_dl acme/Qwen3-GGUF advises.gguf
+expect_rc 3 "refused"
+expect_out 'Set CTX_SIZE=[0-9]+ in .env'
+suggested="$(sed -n 's/.*Set CTX_SIZE=\([0-9]*\) .*/\1/p' <<<"$OUT" | head -1)"
+# Derive the expectation rather than hardcoding it: the suggestion must fit the
+# room it was computed from, and one step larger must not.
+room=$(( (FIT_BUDGET * 75 / 100 - 4096) * 1048576 ))
+per_token=$(( 9216 * 34 / 32 * 2 ))
+if [[ -n "$suggested" ]] && (( suggested > 0 )) \
+   && (( suggested * per_token <= room )) && (( (suggested + 256) * per_token > room )); then
+  pass "the suggested CTX_SIZE=$suggested is the largest that fits"
+else
+  fail "the suggested context is not the largest that fits" \
+       "suggested=$suggested room=$room per_token=$per_token"
+fi
+
+case_start "a model with no room for any context says so instead of suggesting zero"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" $((7 * 1024 * 1024 * 1024))
+fit_env 16384
+run_dl acme/Qwen3-GGUF noroom.gguf
+expect_rc 3 "refused"
+expect_out 'no room for any context'
+expect_not_out 'CTX_SIZE=0'
+# The weights are 7168 MiB against a 5764 MiB budget, so quantising the cache
+# cannot rescue it either. Advice that cannot be taken is worse than none.
+expect_not_out 'Set CACHE_TYPE_K=q8_0'
+
+case_start "quantising the cache is offered only when it opens room"
+# Weights at 4316 MiB leave 4323 - 4316 = 7 MiB under the three-quarter line.
+# One 256-token step costs 9 MiB at f16 and 4.8 MiB at q8_0, so this is the
+# narrow band where quantising the cache is the difference between no context
+# at all and some. A generic "use q8_0" would be right by accident here and
+# wrong in the case above; both have to come from the arithmetic.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" $((4316 * 1048576))
+fit_env 131072 f16 f16
+run_dl acme/Qwen3-GGUF q8helps.gguf
+expect_rc 3 "refused at f16"
+expect_out 'CACHE_TYPE_K=q8_0 and CACHE_TYPE_V=q8_0 with CTX_SIZE=[0-9]+'
+q8ctx="$(sed -n 's/.*CACHE_TYPE_V=q8_0 with CTX_SIZE=\([0-9]*\).*/\1/p' <<<"$OUT" | head -1)"
+room=$(( (FIT_BUDGET * 75 / 100 - 4316) * 1048576 ))
+q8_per_token=$(( 9216 * 34 / 32 * 2 ))
+f16_per_token=$(( 9216 * 2 * 2 ))
+if [[ -n "$q8ctx" ]] && (( q8ctx > 0 )) && (( q8ctx * q8_per_token <= room )) \
+   && (( 256 * f16_per_token > room )); then
+  pass "q8_0 is offered exactly where it opens room f16 does not ($q8ctx tokens)"
+else
+  fail "the q8_0 suggestion is not derived from the room left" \
+       "q8ctx=$q8ctx room=$room q8/tok=$q8_per_token f16/tok=$f16_per_token"
+fi
+
+case_start "a tight fit whose weights are past the line names no context either"
+# The warning branch has the same trap as the refusal: room is negative, so the
+# arithmetic returns 0 and the advice reads "CTX_SIZE=0 would leave room".
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" $((5000 * 1048576))
+fit_env 4096
+run_dl acme/Qwen3-GGUF tightweights.gguf
+expect_out 'compute buffers'
+expect_out 'The weights alone are 5000 MiB'
+expect_not_out 'CTX_SIZE=0'
+
+case_start "--no-fit-check fetches it anyway"
+# The check is a guard, not a policy. A user who knows something it does not -
+# a board about to be reflashed, a model they mean to requantize - must be able
+# to say so, and the refusal has to tell them how.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+# Drive the refusal from the cache rather than the weights, so the same stub can
+# serve the override run honestly: at 19584 bytes a token, 524288 tokens is
+# 9792 MiB of cache on its own, well past the 5764 MiB budget.
+fit_env 524288
+run_dl acme/Qwen3-GGUF override.gguf
+expect_rc 3 "refused without the flag"
+expect_out 'Re-run with --no-fit-check'
+run_dl --no-fit-check acme/Qwen3-GGUF override.gguf
+expect_rc 0 "the flag overrides the refusal"
+expect_out 'skipped \(--no-fit-check\)'
+if [[ -f "$MODELS/override.gguf" ]]; then pass "the model landed with --no-fit-check"
+else fail "--no-fit-check did not download" "$(tr '\n' '|' <<<"$OUT" | cut -c1-200)"; fi
+# The flag is a modifier, not a mode: it must work in any position and must not
+# be mistaken for the repo argument.
+new_project; MODELS="$PROJ/models"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 524288
+run_dl acme/Qwen3-GGUF trailing.gguf --no-fit-check
+expect_rc 0 "accepted after the positional arguments"
+if [[ -f "$MODELS/trailing.gguf" ]]; then pass "trailing --no-fit-check names the same file"
+else fail "the flag consumed a positional argument" "$(tr '\n' '|' <<<"$OUT" | cut -c1-200)"; fi
+
+case_start "an endpoint that ignores Range does not turn the probe into a download"
+# The failure this guards against is the preflight downloading the very object
+# it exists to avoid downloading: a server that answers a ranged request with
+# the whole body. curl checks the advertised length first, so the probe costs
+# nothing and the check reports that it did not run.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=4096
+start_stub norange "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 16384
+run_dl acme/Qwen3-GGUF norange.gguf
+expect_rc 0 "the download still proceeds"
+expect_out 'Fit check.*skipped'
+if [[ "$(ranged_gets)" -ge 1 ]]; then pass "a ranged request was attempted"
+else fail "no ranged request was attempted" "$(cat "$STUB_LOG")"; fi
+
+case_start "a body whose metadata is not readable is skipped, not guessed at"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok            # the filler GGUF: right magic, no metadata
+fit_env 16384
+run_dl acme/Qwen3-GGUF nometa.gguf
+expect_rc 0 "an unreadable header does not block the download"
+expect_out 'Fit check.*skipped'
+expect_not_out 'will not fit'
+
+case_start "a KV cache type llama.cpp cannot quantize to is named, not sized"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 16384 q3_k q3_k
+run_dl acme/Qwen3-GGUF badtype.gguf
+expect_rc 0 "an unusable cache type is a configuration problem, not a refusal"
+expect_out 'unknown KV cache type: q3_k'
+expect_out 'CACHE_TYPE_K/V'
+
+case_start "an architecture this arithmetic overestimates is not refused on an upper bound"
+# A sliding-window model needs less cache than the formula computes, and an
+# upper bound cannot prove a model does *not* fit. Refusing on it would block a
+# model the board can actually hold.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$SWAGGUF" "$(stat -c %s "$SWAGGUF")"
+fit_env 524288
+run_dl acme/Gemma-GGUF swa.gguf
+expect_rc 0 "an upper bound past the budget still downloads"
+expect_out 'upper bound'
+if [[ -f "$MODELS/swa.gguf" ]]; then pass "the sliding-window model landed"
+else fail "an upper bound blocked a model that may well fit" "$(tr '\n' '|' <<<"$OUT" | cut -c1-200)"; fi
+
+case_start "a host with no memory budget reports that instead of a verdict"
+new_project; MODELS="$PROJ/models"
+mkdir -p "$TMPROOT/cpuroot/proc"
+printf 'MemTotal:       32000000 kB\n' >"$TMPROOT/cpuroot/proc/meminfo"
+DL_SYSROOT="$TMPROOT/cpuroot"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 16384
+run_dl acme/Qwen3-GGUF cpuhost.gguf
+expect_rc 0 "a CPU-only host downloads what it is asked for"
+expect_out 'no GPU memory budget'
+expect_not_out 'will not fit'
+
+case_start "a warning is not a refusal when the model is merely tight"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+# A 262144-token q8_0 cache is 4896 MiB, 84% of the 5764 MiB budget: past the
+# point where the compute buffers comfortably fit, not past the budget itself.
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 262144
+run_dl acme/Qwen3-GGUF tight.gguf
+expect_rc 0 "a tight fit is still fetched"
+expect_out 'compute buffers'
+expect_not_out 'will not fit'
+
+case_start "--recommended is sized against the board it was recommended for"
+# The end-to-end shape of the whole feature: detection picks the model, the
+# preflight confirms the board can serve it, and the two agree.
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"; DL_FIT_HEADER=65536
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 16384
+run_dl --recommended
+expect_rc 0 "recommended model passes its own fit check"
+expect_out "Memory budget : $FIT_BUDGET MiB"
+expect_out 'Once loaded'
+
+case_start "the sharded path says the fit check did not run"
+new_project; MODELS="$PROJ/models"
+DL_SYSROOT="$FIT_SYSROOT"
+mkdir -p "$PROJ/.venv/bin"
+cat >"$PROJ/.venv/bin/hf" <<EOF
+#!/usr/bin/env bash
+dir=""
+while [[ \$# -gt 0 ]]; do [[ "\$1" == "--local-dir" ]] && dir="\$2"; shift; done
+mkdir -p "\$dir/Q4_K_M"
+cp "$FITGGUF" "\$dir/Q4_K_M/shard-00001-of-00002.gguf"
+EOF
+chmod +x "$PROJ/.venv/bin/hf"
+start_stub ok "$FITGGUF" "$FIT_BODY_BYTES"
+fit_env 16384
+run_dl acme/Qwen3-GGUF --include 'Q4_K_M/*'
+expect_rc 0 "sharded download succeeds"
+expect_out 'Fit check.*not available for sharded models'
+expect_out 'validate.sh'
+
+DL_SYSROOT=""; DL_FIT_HEADER=""
 
 # ══════════════════════════════════════════════════════════════════
 stop_stub

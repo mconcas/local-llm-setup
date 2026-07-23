@@ -312,6 +312,19 @@ fi
 out="$(run_detect_human "$root")"
 contains "$out" "leaving little for the KV cache" "human report warns that the board is undersized"
 
+begin "A board the smallest model cannot load at all does not suggest a smaller context"
+# 1900 MiB of RAM leaves a 364 MiB budget, and the 0.5B weights are 379 before
+# a single cache byte. "Lower CTX_SIZE" is then advice that cannot be taken -
+# the same defect shape as a fit check that reports CTX_SIZE=0 as a solution.
+root="$(fake_root nano-too-small 1945600)"
+with_tegra_release "$root" 32 7.4
+with_device_tree_model "$root" "NVIDIA Jetson Nano Developer Kit"
+with_uname "$root" aarch64
+out="$(run_detect_human "$root")"
+contains "$out" "will not load on this board" "says the weights alone do not fit"
+contains "$out" "larger board" "names the only option there is"
+not_contains "$out" "lower CTX_SIZE" "does not offer a context that cannot help"
+
 # ══════════════════════════════════════════════════════════════════
 # Discrete NVIDIA GPUs
 # ══════════════════════════════════════════════════════════════════
@@ -423,6 +436,105 @@ for mem_mib in 2048 3072 4096 6144 7856 8192 12288 16384 24576 32768 65536 13107
   prev_weights="$weights"
 done
 (( sweep_fail == 0 )) && pass "$sweep_n memory sizes: weights fit, KV headroom kept, tiers monotonic"
+
+# ══════════════════════════════════════════════════════════════════
+# The catalogue against the arithmetic that judges it
+# ══════════════════════════════════════════════════════════════════
+# The sweep above uses a headroom rule of its own - weights under 60% of the
+# budget - which is a proxy, and the repo has already been bitten by every
+# proxy it has trusted. validate.sh no longer asks that question: it computes
+# the KV cache from the model's metadata and reserves a quarter of the budget
+# for the compute buffers. So a recommendation could pass detection's own rule
+# and then be refused by the suite that validates it, and nothing would notice.
+#
+# Close it here by judging the catalogue with the real formula. The geometry
+# below is not assumed: it is what lib/gguf.py reads from these exact objects
+# on huggingface.co (verified by fetching the first 8 MiB of each), and
+# REC_MODEL_MB is their byte count over 1048576. A tier that is renamed,
+# resized or re-quantised has to update both.
+. "$SCRIPT_DIR/lib/mem.sh"
+
+declare -A CAT_KV_ELEMS=(
+  [Qwen2.5-14B-Instruct-Q4_K_M.gguf]=49152    # 48 layers x 8 KV heads x 128
+  [Qwen2.5-7B-Instruct-Q4_K_M.gguf]=14336     # 28 x 4 x 128
+  [Qwen2.5-3B-Instruct-Q4_K_M.gguf]=9216      # 36 x 2 x 128
+  [Qwen2.5-1.5B-Instruct-Q4_K_M.gguf]=7168    # 28 x 2 x 128
+  [Qwen2.5-0.5B-Instruct-Q4_K_M.gguf]=3072    # 24 x 2 x 64
+)
+declare -A CAT_REAL_MIB=(
+  [Qwen2.5-14B-Instruct-Q4_K_M.gguf]=8571     # 8988110976 B
+  [Qwen2.5-7B-Instruct-Q4_K_M.gguf]=4466      # 4683074240 B
+  [Qwen2.5-3B-Instruct-Q4_K_M.gguf]=1840      # 1929903264 B
+  [Qwen2.5-1.5B-Instruct-Q4_K_M.gguf]=940     #  986048768 B
+  [Qwen2.5-0.5B-Instruct-Q4_K_M.gguf]=379     #  397808192 B
+)
+
+begin "Invariant sweep - every recommendation fits the arithmetic validate.sh uses"
+cat_fail=0; cat_n=0
+declare -A CAT_SEEN=()
+# Total-RAM values chosen to land the budget on each tier boundary as well as
+# between them: the OS reserve is 2048 MiB at or above 7000 and 1536 below, so
+# 22048 gives exactly 20000 and 6036 exactly 4500.
+for mem_mib in 1900 2400 3736 4096 6036 6144 7856 12048 16384 22048 32768 65536; do
+  root="$(fake_root "cat-$mem_mib" $((mem_mib * 1024)))"
+  with_tegra_release "$root" 36 4.7
+  with_cdi_spec "$root" etc
+  with_uname "$root" aarch64
+  run_detect "$root" || { cat_fail=1; continue; }
+  cat_n=$((cat_n + 1))
+
+  budget="${RES[GPU_MEM_MB]}"; file="${RES[REC_MODEL_FILE]}"
+  weights="${RES[REC_MODEL_MB]}"; ctx="${RES[REC_CTX_SIZE]}"; ct="${RES[REC_CACHE_TYPE]}"
+  CAT_SEEN["$file"]=1
+
+  elems="${CAT_KV_ELEMS[$file]:-}"
+  if [[ -z "$elems" ]]; then
+    fail "${mem_mib} MiB board" "recommends $file, which the catalogue has no geometry for"
+    cat_fail=1; continue
+  fi
+  if [[ "$weights" != "${CAT_REAL_MIB[$file]}" ]]; then
+    fail "${mem_mib} MiB board" \
+         "REC_MODEL_MB=$weights for $file; the object is ${CAT_REAL_MIB[$file]} MiB"
+    cat_fail=1; continue
+  fi
+
+  kv_mib="$(mem_mib "$(mem_kv_bytes "$ctx" "$elems" "$elems" "$ct" "$ct")")"
+  total=$(( weights + kv_mib ))
+
+  # The rule validate.sh applies: the deployment fits, and it leaves the
+  # compute buffers the quarter of the budget that is held back for them.
+  #
+  # Below the 1.5B tier the board itself is the limit and no catalogue entry
+  # can fix it - a Jetson Nano 2 GB has 364 MiB to spend and the smallest
+  # instruction-tuned GGUF worth serving is 379. That is not a defect in the
+  # tiers, but it must not be silent either, so the requirement there is that
+  # the user is told rather than that the arithmetic works out.
+  pct=$(( total * 100 / budget ))
+  if (( budget < 2200 )); then
+    if (( pct > 75 )) && ! run_detect_human "$root" | grep -q "WARNING"; then
+      fail "${mem_mib} MiB board" \
+           "$file takes ${pct}% of the ${budget} MiB budget with no warning"
+      cat_fail=1
+    fi
+    continue
+  fi
+  if (( total >= budget )); then
+    fail "${mem_mib} MiB board" \
+         "$file at ${ctx}/${ct} needs ${total} MiB against a ${budget} MiB budget"
+    cat_fail=1; continue
+  fi
+  if (( pct > 75 )); then
+    fail "${mem_mib} MiB board" \
+         "$file at ${ctx}/${ct} is ${pct}% of the budget; validate.sh warns above 75%"
+    cat_fail=1; continue
+  fi
+done
+if (( ${#CAT_SEEN[@]} != ${#CAT_KV_ELEMS[@]} )); then
+  fail "the sweep reaches every tier" \
+       "saw ${#CAT_SEEN[@]} of ${#CAT_KV_ELEMS[@]} models: ${!CAT_SEEN[*]}"
+  cat_fail=1
+fi
+(( cat_fail == 0 )) && pass "$cat_n memory sizes across all ${#CAT_KV_ELEMS[@]} tiers: weights + KV cache fit with the buffers' quarter kept free"
 
 begin "Invariant - --env output is safe to eval"
 root="$(fake_root eval-safety 8218000)"

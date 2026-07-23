@@ -23,7 +23,7 @@
 #   LLAMA_IMAGE        container image to run
 #   REC_MODEL_REPO     recommended Hugging Face GGUF repo
 #   REC_MODEL_FILE     recommended GGUF filename
-#   REC_MODEL_MB       approximate on-disk size of that model
+#   REC_MODEL_MB       on-disk size of that model, in MiB
 #   REC_CTX_SIZE       recommended context window
 #   REC_PARALLEL       recommended concurrent request slots
 #   REC_CACHE_TYPE     recommended KV cache quantisation
@@ -157,28 +157,35 @@ fi
 # Sized so that weights plus KV cache fit in GPU_MEM_MB with room to spare.
 # All candidates are instruction-tuned and handle OpenAI-style tool calls,
 # which is what this stack is normally pointed at.
+#
+# REC_MODEL_MB is the real object size in MiB, not a round number: every other
+# memory figure in this repo is MiB (GPU_MEM_MB comes from MemTotal/1024, and
+# nvidia-smi reports MiB), so a decimal-MB entry here would be compared against
+# a MiB budget by REC_MODEL_PCT, by setup.sh's download prompt and by the
+# invariant sweep in the self-test. The values below are the byte counts
+# huggingface.co reports for these objects, divided by 1048576.
 if   (( GPU_MEM_MB >= 20000 )); then
   REC_MODEL_REPO="bartowski/Qwen2.5-14B-Instruct-GGUF"
   REC_MODEL_FILE="Qwen2.5-14B-Instruct-Q4_K_M.gguf"
-  REC_MODEL_MB=8990; REC_CTX_SIZE=16384; REC_PARALLEL=4; REC_CACHE_TYPE="f16"
+  REC_MODEL_MB=8571; REC_CTX_SIZE=16384; REC_PARALLEL=4; REC_CACHE_TYPE="f16"
 elif (( GPU_MEM_MB >= 10000 )); then
   REC_MODEL_REPO="bartowski/Qwen2.5-7B-Instruct-GGUF"
   REC_MODEL_FILE="Qwen2.5-7B-Instruct-Q4_K_M.gguf"
-  REC_MODEL_MB=4680; REC_CTX_SIZE=16384; REC_PARALLEL=2; REC_CACHE_TYPE="f16"
+  REC_MODEL_MB=4466; REC_CTX_SIZE=16384; REC_PARALLEL=2; REC_CACHE_TYPE="f16"
 elif (( GPU_MEM_MB >= 4500 )); then
-  # Orin Nano Super 8 GB lands here: ~1.9 GB of weights leaves plenty of room
+  # Orin Nano Super 8 GB lands here: ~1.8 GiB of weights leaves plenty of room
   # for a 16k KV cache once it is quantised to q8_0.
   REC_MODEL_REPO="bartowski/Qwen2.5-3B-Instruct-GGUF"
   REC_MODEL_FILE="Qwen2.5-3B-Instruct-Q4_K_M.gguf"
-  REC_MODEL_MB=1930; REC_CTX_SIZE=16384; REC_PARALLEL=1; REC_CACHE_TYPE="q8_0"
+  REC_MODEL_MB=1840; REC_CTX_SIZE=16384; REC_PARALLEL=1; REC_CACHE_TYPE="q8_0"
 elif (( GPU_MEM_MB >= 2200 )); then
   REC_MODEL_REPO="bartowski/Qwen2.5-1.5B-Instruct-GGUF"
   REC_MODEL_FILE="Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
-  REC_MODEL_MB=1120; REC_CTX_SIZE=8192; REC_PARALLEL=1; REC_CACHE_TYPE="q8_0"
+  REC_MODEL_MB=940; REC_CTX_SIZE=8192; REC_PARALLEL=1; REC_CACHE_TYPE="q8_0"
 else
   REC_MODEL_REPO="bartowski/Qwen2.5-0.5B-Instruct-GGUF"
   REC_MODEL_FILE="Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-  REC_MODEL_MB=400; REC_CTX_SIZE=4096; REC_PARALLEL=1; REC_CACHE_TYPE="q8_0"
+  REC_MODEL_MB=379; REC_CTX_SIZE=4096; REC_PARALLEL=1; REC_CACHE_TYPE="q8_0"
 fi
 
 # Weights are only part of the footprint: the KV cache, the compute buffers and
@@ -241,7 +248,15 @@ echo "  Parallel      : $REC_PARALLEL slot(s)"
 echo "  KV cache      : $REC_CACHE_TYPE"
 (( GPU_MEM_MB > 0 )) && echo "  Weights use   : ${REC_MODEL_PCT}% of the budget"
 
-if (( GPU_MEM_MB > 0 && REC_MODEL_PCT > 60 )); then
+if (( GPU_MEM_MB > 0 && REC_MODEL_MB >= GPU_MEM_MB )); then
+  # No context is small enough to rescue this: the weights do not fit before
+  # the cache is allocated at all. Advice that cannot be taken is worse than
+  # none, so do not offer CTX_SIZE here.
+  echo ""
+  echo "WARNING: the smallest supported model is ${REC_MODEL_MB} MiB of weights against a"
+  echo "         ${GPU_MEM_MB} MiB budget, so it will not load on this board whatever"
+  echo "         CTX_SIZE is set to. Run this stack on a larger board."
+elif (( GPU_MEM_MB > 0 && REC_MODEL_PCT > 60 )); then
   echo ""
   echo "WARNING: even the smallest supported model takes ${REC_MODEL_PCT}% of this board's"
   echo "         ${GPU_MEM_MB} MiB budget, leaving little for the KV cache. Expect to"

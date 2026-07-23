@@ -17,6 +17,9 @@
 #   Reclaim disk from interrupted downloads:
 #     ./scripts/download-model.sh --prune
 #
+# Options:
+#   --no-fit-check    download even if the model cannot run on this board
+#
 # Examples:
 #   ./scripts/download-model.sh --recommended
 #   ./scripts/download-model.sh TheBloke/Mistral-7B-Instruct-v0.2-GGUF \
@@ -24,6 +27,14 @@
 #   ./scripts/download-model.sh unsloth/Qwen3.5-397B-A17B-GGUF --include 'Q4_K_M/*'
 #
 # Files are saved to MODELS_DIR (from .env), defaulting to ./models.
+#
+# Before transferring the body, the model is sized against this board: GGUF
+# keeps its metadata at the head of the file, so one ranged request is enough to
+# compute the KV cache the configured CTX_SIZE and CACHE_TYPE_K/V will ask for.
+# A model that cannot be served is the "useless model file" this script exists
+# to keep off the disk, and refusing it costs a few MiB instead of several GB.
+#
+# Exit codes: 0 ok, 1 the download failed, 2 wrong arguments, 3 it will not fit.
 #
 # HF_ENDPOINT overrides the Hugging Face base URL (a mirror, an internal proxy).
 # huggingface_hub honours the same variable, so both download paths agree.
@@ -41,6 +52,10 @@ export HF_ENDPOINT
 # wrong is invisible until several GB have landed in a directory nothing reads.
 ENV_FILE="$PROJECT_DIR/.env"
 . "$SCRIPT_DIR/lib/env.sh"
+# The same arithmetic validate.sh uses. Sharing it is the point: a model this
+# script accepts must be one the suite then agrees fits, or the two disagree
+# about the deployment and the user finds out from a crash loop.
+. "$SCRIPT_DIR/lib/mem.sh"
 
 # ── Destination ────────────────────────────────────────────────
 # docker-compose.yml bind-mounts ${MODELS_DIR:-./models} at /models, and both
@@ -68,6 +83,9 @@ Usage:
   $0 <hf-repo> <gguf-filename>
   $0 <hf-repo> --include <pattern>
   $0 --prune                        # delete interrupted partial downloads
+
+Options:
+  --no-fit-check                    download even if it cannot run here
 
 Examples:
   $0 --recommended
@@ -137,6 +155,182 @@ check_space() {
   fi
 }
 
+# ── Will it actually run once it is here? ──────────────────────
+# Free space is only half the question. On a Jetson the weights, the KV cache
+# and the compute buffers all come out of the one pool the OS is already using,
+# and none of that is visible in the file size: the same 1.8 GiB model needs
+# 306 MiB of cache at CTX_SIZE=16384/q8_0 and 6 GiB at 131072/f16. A model the
+# board cannot serve is exactly the file the objective says not to leave lying
+# around, so decide before the body is transferred rather than after.
+FIT_CHECK=1
+# How much of the head to read. GGUF stores its metadata block first, so the
+# geometry is always in the prefix; 16 MiB clears the largest tokenizer array in
+# the recommended set (the 14B needs just under 8). Configurable because the
+# self-test serves models whose metadata ends far sooner.
+FIT_HEADER_BYTES="${FIT_HEADER_BYTES:-16777216}"
+
+# platform_probe - run detect-platform.sh once and eval its output here.
+# rc=1 with the reason in PLATFORM_PROBE_ERR when it cannot be read. Keeps the
+# probe's stderr out of the string that gets eval'd: any warning it learns to
+# print would otherwise be executed as shell.
+PLATFORM_PROBED=0
+PLATFORM_PROBE_RC=0
+PLATFORM_PROBE_ERR=""
+platform_probe() {
+  (( PLATFORM_PROBED )) && return "$PLATFORM_PROBE_RC"
+  PLATFORM_PROBED=1
+  local err penv
+  err="$(mktemp)"
+  if penv="$(bash "$SCRIPT_DIR/detect-platform.sh" --env 2>"$err")"; then
+    eval "$penv"
+  else
+    PLATFORM_PROBE_RC=1
+  fi
+  PLATFORM_PROBE_ERR="$(cat "$err")"
+  rm -f "$err"
+  return "$PLATFORM_PROBE_RC"
+}
+
+# fit_fetch_header URL DEST - the first FIT_HEADER_BYTES of URL.
+#
+# --max-filesize is not belt-and-braces: a server that ignores Range answers 200
+# with the whole object, and without it this "preflight" would download the very
+# model it was meant to avoid downloading. curl checks the advertised length
+# before transferring, so an endpoint with no range support costs nothing.
+fit_fetch_header() {
+  local url="$1" dest="$2"
+  curl -sfL --max-time 120 \
+       -r "0-$((FIT_HEADER_BYTES - 1))" \
+       --max-filesize "$FIT_HEADER_BYTES" \
+       -o "$dest" "$url" 2>/dev/null
+}
+
+# check_fit URL WEIGHT_BYTES - refuse a model this board cannot serve (exit 3).
+# Anything that cannot be established - no budget, no metadata, an endpoint with
+# no range support - is reported as a skip with its reason and lets the download
+# proceed. A preflight that guesses is worse than one that says it did not run.
+check_fit() {
+  local url="$1" bytes="$2"
+  (( FIT_CHECK )) || { echo "    Fit check     : skipped (--no-fit-check)"; return 0; }
+
+  if ! platform_probe; then
+    echo "    Fit check     : skipped (platform detection failed)"
+    return 0
+  fi
+  if [[ -z "${GPU_MEM_MB:-}" ]] || (( GPU_MEM_MB <= 0 )); then
+    echo "    Fit check     : skipped (${PLATFORM_LABEL:-this host} has no GPU memory budget)"
+    return 0
+  fi
+
+  # The configuration the model will be served under, which is what decides the
+  # cache. .env wins over the recommendation: a user who lowered CTX_SIZE has
+  # already made this decision, and sizing against the default would refuse a
+  # model their own configuration can hold.
+  local ctx tk tv
+  ctx="$(env_get CTX_SIZE)";    ctx="${ctx:-${REC_CTX_SIZE:-4096}}"
+  tk="$(env_get CACHE_TYPE_K)"; tk="${tk:-${REC_CACHE_TYPE:-f16}}"
+  tv="$(env_get CACHE_TYPE_V)"; tv="${tv:-${REC_CACHE_TYPE:-f16}}"
+  [[ "$ctx" =~ ^[0-9]+$ ]] && (( ctx > 0 )) || ctx=4096
+
+  local hdr; hdr="$(mktemp)"
+  if ! fit_fetch_header "$url" "$hdr"; then
+    rm -f "$hdr"
+    echo "    Fit check     : skipped (the model header could not be fetched)"
+    return 0
+  fi
+  local meta why
+  why="$(mktemp)"
+  if ! meta="$(mem_model_read "$hdr" 2>"$why")"; then
+    echo "    Fit check     : skipped ($(cat "$why"))"
+    rm -f "$hdr" "$why"
+    return 0
+  fi
+  rm -f "$hdr" "$why"
+  # Eval-safe by contract - see lib/gguf.py, which quotes every string field and
+  # emits nothing at all rather than a partial record.
+  eval "$meta"
+
+  local kv
+  if ! kv="$(mem_kv_bytes "$ctx" "$GGUF_K_ELEMS_PER_TOKEN" "$GGUF_V_ELEMS_PER_TOKEN" \
+                          "$tk" "$tv" 2>&1)"; then
+    echo "    Fit check     : skipped ($kv)"
+    echo "                    CACHE_TYPE_K/V in .env is not a type llama.cpp quantizes to."
+    return 0
+  fi
+
+  local w_mib kv_mib total pct
+  w_mib=$(( bytes / 1048576 ))
+  kv_mib="$(mem_mib "$kv")"
+  total=$(( w_mib + kv_mib ))
+  pct=$(( total * 100 / GPU_MEM_MB ))
+  echo "    Memory budget : ${GPU_MEM_MB} MiB (${PLATFORM_LABEL:-this host})"
+  echo "    Once loaded   : weights ${w_mib} + ${ctx}-token ${tk}/${tv} KV cache ${kv_mib}" \
+       "= ${total} MiB (${pct}%)"
+
+  # The largest context that leaves the compute buffers somewhere to live. Same
+  # quarter-of-the-budget reservation validate.sh makes, and for the same
+  # reason: their size is a property of the llama.cpp build, so it is held back
+  # rather than guessed at.
+  local room=$(( (GPU_MEM_MB * 75 / 100 - w_mib) * 1048576 ))
+  local fit_ctx=0 fit_ctx_q8=0
+  if (( room > 0 )); then
+    fit_ctx="$(mem_max_ctx "$room" "$GGUF_K_ELEMS_PER_TOKEN" \
+                           "$GGUF_V_ELEMS_PER_TOKEN" "$tk" "$tv" || echo 0)"
+    # Quantising the cache halves it, so it can open room that the configured
+    # type does not - but only while there is room at all. Compute it rather
+    # than offering it as generic advice: on a board whose weights are already
+    # past the line, "use q8_0" is a suggestion that cannot be taken.
+    fit_ctx_q8="$(mem_max_ctx "$room" "$GGUF_K_ELEMS_PER_TOKEN" \
+                              "$GGUF_V_ELEMS_PER_TOKEN" q8_0 q8_0 || echo 0)"
+  fi
+
+  # An architecture this arithmetic overestimates gives an upper bound, and an
+  # upper bound cannot prove a model does *not* fit. Report it and let the
+  # transfer go ahead rather than refusing on a number known to be too large.
+  if (( total >= GPU_MEM_MB )) && [[ -n "${GGUF_ESTIMATE_CAVEAT:-}" ]]; then
+    echo "⚠  That is an upper bound: ${GGUF_ESTIMATE_CAVEAT}"
+    echo "   The real footprint is smaller, so the download continues."
+    return 0
+  fi
+
+  if (( total >= GPU_MEM_MB )); then
+    echo "" >&2
+    echo "Error: this model will not fit on ${PLATFORM_LABEL:-this board}." >&2
+    echo "  weights $(human "$bytes") + a ${ctx}-token ${tk}/${tv} KV cache" \
+         "= ${total} MiB, against a ${GPU_MEM_MB} MiB budget." >&2
+    if (( fit_ctx > 0 )); then
+      echo "  Set CTX_SIZE=$fit_ctx in .env and re-run - that context does fit." >&2
+      (( fit_ctx_q8 > fit_ctx )) &&
+        echo "  With CACHE_TYPE_K=q8_0 and CACHE_TYPE_V=q8_0, CTX_SIZE=$fit_ctx_q8 fits." >&2
+    elif (( fit_ctx_q8 > 0 )); then
+      echo "  No context fits with a ${tk}/${tv} cache. Set CACHE_TYPE_K=q8_0 and" \
+           "CACHE_TYPE_V=q8_0 with CTX_SIZE=$fit_ctx_q8, which does." >&2
+    else
+      echo "  Weights of ${w_mib} MiB against a ${GPU_MEM_MB} MiB budget leave" \
+           "no room for any context, whatever the cache type." >&2
+      [[ -n "${REC_MODEL_FILE:-}" ]] &&
+        echo "  This board is sized for ${REC_MODEL_REPO}/${REC_MODEL_FILE}." >&2
+    fi
+    echo "  Nothing was downloaded. Re-run with --no-fit-check to fetch it anyway." >&2
+    exit 3
+  fi
+
+  if (( pct > 75 )); then
+    echo "⚠  That leaves ${GPU_MEM_MB} - ${total} = $(( GPU_MEM_MB - total )) MiB for the"
+    echo "   compute buffers, which are not in that total and are usually a few"
+    echo "   hundred MiB. Expect it to be tight."
+    # Same reason the refusal derives its advice: past the line the weights put
+    # it, there is no context to name, and "CTX_SIZE=0 has room" is what the
+    # arithmetic literally returns.
+    if (( fit_ctx > 0 )); then
+      echo "   CTX_SIZE=${fit_ctx} would leave the buffers room."
+    else
+      echo "   The weights alone are ${w_mib} MiB of the budget, so no context does."
+    fi
+  fi
+  return 0
+}
+
 # A GGUF file starts with the magic bytes "GGUF". An HTTP error body ("Entry
 # not found"), an HTML login page or a half-finished transfer does not - and
 # each of those otherwise lands on disk named *.gguf, gets auto-wired into
@@ -179,6 +373,18 @@ die_usage() {
   exit 2
 }
 
+# --no-fit-check is a modifier, not a mode, so pull it out before the positional
+# parse below rather than adding it to every branch. ${a[@]+"${a[@]}"} because
+# an empty array under `set -u` is an unbound variable, not an empty list.
+_argv=()
+for _a in "$@"; do
+  case "$_a" in
+    --no-fit-check) FIT_CHECK=0 ;;
+    *) _argv+=("$_a") ;;
+  esac
+done
+set -- ${_argv[@]+"${_argv[@]}"}
+
 if [[ $# -lt 1 ]]; then usage >&2; exit 2; fi
 
 case "$1" in
@@ -197,23 +403,18 @@ case "$1" in
     exit 0
     ;;
   --recommended)
-    # Keep stderr out of the string that gets eval'd: any warning the probe
-    # learns to print would otherwise be executed as shell. And check what came
-    # back - a probe that fails on an unfamiliar host used to leave every
-    # REC_* variable unset, so the next line died with a raw bash
+    # Check what came back - a probe that fails on an unfamiliar host used to
+    # leave every REC_* variable unset, so the next line died with a raw bash
     # "REC_MODEL_REPO: unbound variable" instead of saying what went wrong.
-    _perr="$(mktemp)"
-    trap 'rm -f "$_perr"' EXIT
-    if ! _penv="$(bash "$SCRIPT_DIR/detect-platform.sh" --env 2>"$_perr")"; then
+    if ! platform_probe; then
       echo "Error: platform detection failed - cannot pick a model for this machine." >&2
-      [[ -s "$_perr" ]] && sed 's/^/  /' "$_perr" >&2
+      [[ -n "$PLATFORM_PROBE_ERR" ]] && sed 's/^/  /' <<<"$PLATFORM_PROBE_ERR" >&2
       echo "  Name the repo and file explicitly instead: $0 <hf-repo> <gguf-filename>" >&2
       exit 1
     fi
-    eval "$_penv"
     if [[ -z "${REC_MODEL_REPO:-}" || -z "${REC_MODEL_FILE:-}" ]]; then
       echo "Error: platform detection returned no model recommendation." >&2
-      [[ -s "$_perr" ]] && sed 's/^/  /' "$_perr" >&2
+      [[ -n "$PLATFORM_PROBE_ERR" ]] && sed 's/^/  /' <<<"$PLATFORM_PROBE_ERR" >&2
       echo "  Run ./scripts/detect-platform.sh to see what it found." >&2
       echo "  Name the repo and file explicitly instead: $0 <hf-repo> <gguf-filename>" >&2
       exit 1
@@ -272,8 +473,12 @@ if [[ "$1" == "--include" ]]; then
   echo "==> Downloading from $REPO (pattern: $PATTERN) …"
   echo "    Destination: $MODEL_DIR/"
   # Shard sizes are only known to the CLI, so report headroom rather than
-  # gating on a total this script cannot compute.
+  # gating on a total this script cannot compute. The fit check needs a single
+  # object's size and URL for the same reason, so it does not run here either -
+  # say so rather than let its silence read as a pass.
   echo "    Free on disk: $(human "$(free_bytes "$MODEL_DIR")")"
+  echo "    Fit check   : not available for sharded models - run"
+  echo "                  ./scripts/validate.sh once MODEL_FILE points at the first shard."
   echo ""
 
   "$HF_CLI" download "$REPO" \
@@ -365,6 +570,7 @@ if [[ -z "$SIZE" ]]; then
   exit 1
 fi
 check_space "$SIZE" "$MODEL_DIR"
+check_fit "$URL" "$SIZE"
 echo ""
 
 echo "==> Downloading $FILE from $REPO …"

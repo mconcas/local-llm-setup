@@ -165,6 +165,24 @@ resized model tier could break: the recommended weights fit the budget, they
 leave at least 40% of it for the KV cache and compute buffers, and a larger
 board is never given a smaller model than a smaller one.
 
+Those three are a proxy, though, and a second sweep judges the catalogue with
+the real formula instead - the same `lib/mem.sh` arithmetic `validate.sh` and
+the download fit check use. For every tier it asserts that `REC_MODEL_MB` is the
+object's actual size in MiB, and that the weights plus the KV cache at the
+recommended `CTX_SIZE` and `CACHE_TYPE` fit the budget the tier is chosen at
+with the compute buffers' quarter still free. Without it a recommendation could
+pass detection's own headroom rule and then be refused by the suite that
+validates it. The KV geometry each tier is judged against
+(`Qwen2.5-14B` 48x8x128, `7B` 28x4x128, `3B` 36x2x128, `1.5B` 28x2x128, `0.5B`
+24x2x64) is what `lib/gguf.py` reads from those exact objects on Hugging Face,
+not an assumption - a renamed or re-quantised tier has to update both.
+
+The one board where the tiers genuinely lose is the Jetson Nano 2 GB: a 364 MiB
+budget against 379 MiB of weights for the smallest instruction-tuned GGUF worth
+serving. That is a limit of the board, so it is reported rather than papered
+over - and reported honestly, since no `CTX_SIZE` can rescue a model whose
+weights do not fit before the cache exists at all.
+
 `validate.sh` runs it as part of preflight, so a normal validation run reports
 the cross-platform result alongside the checks for the machine in hand.
 
@@ -246,9 +264,17 @@ Model files are the only large artifact this stack keeps, and a Jetson is
 usually the machine with the least room to spare, so `download-model.sh` is
 built not to waste it:
 
-- **It refuses downloads that would not fit.** The size is probed over HTTP
-  first and compared against real free space on `MODELS_DIR`, keeping a 512 MiB
-  margin. Nothing is transferred when it would not fit.
+- **It refuses downloads that would not fit on disk.** The size is probed over
+  HTTP first and compared against real free space on `MODELS_DIR`, keeping a
+  512 MiB margin. Nothing is transferred when it would not fit.
+- **It refuses downloads that would not fit in memory either.** Free space says
+  whether the file can land, not whether the model can be *served*, and a model
+  the board cannot load is the useless multi-gigabyte file this whole section is
+  about. GGUF keeps its metadata at the head of the object, so one ranged
+  request is enough to read the geometry and compute the KV cache that
+  `CTX_SIZE` and `CACHE_TYPE_K/V` will ask for - before any of the body moves.
+  See [Does it fit?](#does-it-fit---memory-sizing-on-a-shared-memory-board) for
+  the arithmetic, which is the same code `validate.sh` uses.
 - **It never leaves junk named `*.gguf`.** Every download is verified against
   the GGUF magic bytes and the expected byte count; anything else is deleted.
   Without this a typo'd filename silently produces a 15-byte file containing
@@ -273,11 +299,43 @@ built not to waste it:
 ```bash
 ./scripts/download-model.sh --recommended   # model sized for this machine
 ./scripts/download-model.sh --prune         # reclaim interrupted downloads
+./scripts/download-model.sh --no-fit-check <repo> <file>   # fetch it anyway
 ```
 
 `--prune` deletes partial transfers (`*.incomplete`, `*.gguf.part`) and lists
 the models on disk. Only the one named by `MODEL_FILE` is ever served, so any
 others are safe to delete; `validate.sh` reports how much they hold.
+
+A refusal names the configuration that would work rather than telling you to
+try something smaller. Asking an 8 GB Orin Nano for the 14B looks like this,
+and costs a few MiB of ranged reads instead of 8.4 GiB:
+
+```
+==> Checking Qwen2.5-14B-Instruct-Q4_K_M.gguf in bartowski/Qwen2.5-14B-Instruct-GGUF …
+    Download size : 8.4 GiB
+    Free on disk  : 1697.3 GiB
+    Memory budget : 5571 MiB (NVIDIA Jetson Orin Nano … Super)
+    Once loaded   : weights 8571 + 16384-token q8_0/q8_0 KV cache 306 = 8877 MiB (159%)
+
+Error: this model will not fit on NVIDIA Jetson Orin Nano … Super.
+  Weights of 8571 MiB against a 5571 MiB budget leave no room for any context,
+  whatever the cache type.
+  This board is sized for bartowski/Qwen2.5-3B-Instruct-GGUF/Qwen2.5-3B-Instruct-Q4_K_M.gguf.
+  Nothing was downloaded. Re-run with --no-fit-check to fetch it anyway.
+```
+
+Where a context *would* work it says which one (`Set CTX_SIZE=8192 …`), and
+where quantising the cache is what opens the room it says that instead - both
+derived from the space actually left, never offered generically. Exit status 3
+means "it will not fit" as distinct from 1, "the download failed".
+
+Anything the check cannot establish is reported as a skip with its reason and
+the download proceeds: a host with no GPU budget, a model whose metadata is not
+in the fetched prefix, an endpoint that does not honour `Range`, or an
+architecture (sliding-window, MLA) whose cache this arithmetic overestimates -
+an upper bound cannot prove a model does *not* fit, so it is never refused on
+one. Sharded `--include` downloads say the check did not run rather than let
+their silence read as a pass.
 
 `HF_ENDPOINT` points both download paths at a Hugging Face mirror or an internal
 proxy; `huggingface_hub` honours the same variable.
@@ -298,6 +356,17 @@ free-space refusal, `--prune`, `--recommended` against a synthetic Jetson,
 `MODELS_DIR` in every form a `.env` may legally carry it, the argument errors,
 and the `huggingface-cli` path - which is a separate transfer path that must be
 verified the same way. `validate.sh` runs it as part of preflight.
+
+The fit preflight is covered against a synthetic 8 GB board with models built by
+`test-fixtures/mkgguf.py`, so the geometry the verdict comes from is real: the
+same model and board flipping verdict on `CTX_SIZE` alone, `f16` costing exactly
+twice `q8_0`, a suggested context that is provably the largest that fits, a
+`q8_0` suggestion offered only in the narrow band where it opens room `f16` does
+not, an upper-bound architecture that must not be refused, and an endpoint that
+ignores `Range` - which is the one that matters most, because a probe answered
+with the whole object would download the very model it exists to avoid. That
+the refusal happens before the body moves is asserted on the wire, from the
+stub's request log, rather than inferred from an empty directory.
 
 ### Deployment configuration self-test
 
@@ -395,6 +464,13 @@ What the checks say, in order of how much they know:
 Sliding-window (Gemma 3) and MLA (DeepSeek) models allocate less than this
 formula, so they are reported as an upper bound with the reason, rather than
 having a number invented for them that would refuse a configuration that fits.
+
+The same arithmetic runs one step earlier, in `download-model.sh`, against the
+model's header fetched over HTTP `Range` - so a model that cannot be served is
+refused before its several gigabytes are transferred rather than diagnosed
+afterwards. Sharing the code is the point: a model the downloader accepts is one
+the suite then agrees fits, and `test-detect-platform.sh` judges every entry in
+the recommended-model table by the same formula so the three cannot drift apart.
 
 `test-mem.sh` covers all of it against hand-computed values and against GGUF
 files it builds itself: a 70B at a 128k context, a sliding-window model, an
@@ -740,7 +816,7 @@ TLS stack will accept. It needs no GPU, Docker, model or network, and
 │   ├── detect-platform.sh      # Hardware detection + tuned defaults
 │   ├── gen-certs.sh            # TLS certificate generator (staged + verified)
 │   ├── test-gen-certs.sh       # Hermetic tests for certificate generation
-│   ├── download-model.sh       # Model downloader (size-checked, GGUF-verified)
+│   ├── download-model.sh       # Model downloader (disk- and memory-checked)
 │   ├── test-download-model.sh  # Hermetic tests for the downloader
 │   ├── validate.sh             # End-to-end validation suite
 │   ├── test-validate.sh        # Hermetic tests for the validation suite
@@ -781,6 +857,16 @@ detected by name, with the fix in the message.
 **Jetson: `CUDA error: the provided PTX was compiled with an unsupported toolchain`:**
 - The image has no `sm_87` kernels. Set
   `LLAMA_IMAGE=ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin` in `.env`.
+
+**`download-model.sh` exits 3 with "this model will not fit":**
+- Not a disk problem: the model was sized against this board's memory budget
+  before the transfer started, and the deployment `.env` describes cannot hold
+  it. The message names what to change - a `CTX_SIZE` that fits, or `q8_0` for
+  the cache where that is what opens the room.
+- If the weights alone are past the budget, no setting helps; use the model
+  `./scripts/detect-platform.sh` recommends for this board.
+- To fetch it regardless (a board about to be reflashed, a model you mean to
+  requantise), pass `--no-fit-check`.
 
 **Jetson: `cudaMalloc failed: out of memory` while loading:**
 - Unified memory is exhausted. Lower `CTX_SIZE`, set `PARALLEL=1`, set
