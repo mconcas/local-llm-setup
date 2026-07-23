@@ -78,6 +78,8 @@ docker compose up -d
 
 ./scripts/test-detect-platform.sh             # platform detection self-test
 ./scripts/test-compose.sh                     # deployment configuration self-test
+./scripts/test-env-lib.sh                     # configuration reader self-test
+./scripts/test-mem.sh                         # memory sizing self-test
 ./scripts/test-benchmark.sh                   # benchmark self-test
 ./scripts/test-setup.sh                       # bootstrap self-test
 ./scripts/test-download-model.sh              # model acquisition self-test
@@ -89,7 +91,7 @@ docker compose up -d
 `validate.sh` covers platform detection, GPU passthrough wiring, the Compose
 merge, model sizing, disk hygiene, container health, full GPU layer offload, the
 OpenAI endpoints, streaming, tool calling, and the TLS proxy (including that it
-rejects clients which do not trust the CA). It is **44 checks, all green** on a
+rejects clients which do not trust the CA). It is **50 checks, all green** on a
 Jetson Orin Nano Super with the stack up.
 
 Every self-test above also runs as a preflight check, so `./scripts/validate.sh`
@@ -334,9 +336,119 @@ that the same prompt is a `413` once the body limit is removed, so the assertion
 cannot pass for the wrong reason. It is skipped, with the reason printed, when
 the Docker daemon or the nginx image is unavailable.
 
+### Does it fit? - memory sizing on a shared-memory board
+
+On a Jetson there is no separate VRAM: the model, the KV cache, the compute
+buffers, the OS and the page cache all come out of one LPDDR pool. So "does this
+model fit" is not a property of the file, and until this was written the suite
+answered it as if it were - it compared the GGUF's size against the budget and
+passed anything under 60% of it. For the recommended 3B that is 33%, reported as
+"leaves room for the KV cache" no matter what `CTX_SIZE` said:
+
+| `.env` | Weights | KV cache | Total | Old check | Reality |
+|---|---|---|---|---|---|
+| `CTX_SIZE=4096`, `q8_0` | 1840 MiB | 77 MiB | 1917 MiB | pass (33%) | fine |
+| `CTX_SIZE=16384`, `q8_0` | 1840 MiB | 306 MiB | 2146 MiB | pass (33%) | fine |
+| `CTX_SIZE=131072`, `q8_0` | 1840 MiB | 2448 MiB | 4288 MiB | pass (33%) | no room for the compute buffers |
+| `CTX_SIZE=131072`, `f16` | 1840 MiB | 4608 MiB | 6448 MiB | pass (33%) | `cudaMalloc` failed at load |
+
+The cache is now computed from the model's own metadata rather than guessed at.
+`lib/gguf.py` reads the layer count, the KV head count (per layer, for the
+architectures that vary it), the head dimensions and the trained context out of
+the GGUF header - only the metadata block, so sizing a 40 GiB model costs a few
+hundred KiB of I/O - and `lib/mem.sh` does the arithmetic with ggml's own block
+sizes:
+
+```
+kv_bytes = pad(n_ctx, 256) x (k_elems_per_token x bytes(cache_type_k)
+                            + v_elems_per_token x bytes(cache_type_v))
+```
+
+For Qwen2.5 3B (36 layers, 2 KV heads, head dimension 128) at 16384 tokens with
+a `q8_0` cache, that is `16384 x 36 x 2 x 128 x 2 x 34/32 = 306 MiB`. llama.cpp
+on the Orin Nano Super reports `KV buffer size = 306.03 MiB`.
+
+That agreement is not a coincidence to be admired once and then trusted forever,
+so it is a check. On every runtime run `validate.sh` reads back the size
+llama.cpp actually allocated and compares it against the prediction, and a
+divergence beyond the allocator's own padding goes **red** - because the
+preflight check refuses configurations on that number, and a wrong number is
+worse than none. It also totals every buffer the server reports and compares
+that against the budget `detect-platform.sh` derived, which is the only way to
+find out that the *budget* is optimistic rather than the model too large.
+
+What the checks say, in order of how much they know:
+
+- **the deployment fits** - weights + cache, with both numbers and the
+  percentage of the budget
+- **little room left for the compute buffers** (>75%) - a warning, with the
+  largest `CTX_SIZE` that would leave a quarter free
+- **does not fit** - red, with `CTX_SIZE=<n> fits`, or `CACHE_TYPE_K=q8_0` if
+  the cache is still `f16`, or "no context leaves room on this board" when the
+  weights alone are already past the line
+- **cannot size the KV cache** - a skip naming the reason. An unreadable model
+  is not a model with no cache, and it must not inherit the old file-size
+  verdict
+- **`CTX_SIZE` is beyond this model's trained context** - a warning; llama.cpp
+  serves it, and the output quality is not what the model was trained for
+
+Sliding-window (Gemma 3) and MLA (DeepSeek) models allocate less than this
+formula, so they are reported as an upper bound with the reason, rather than
+having a number invented for them that would refuse a configuration that fits.
+
+`test-mem.sh` covers all of it against hand-computed values and against GGUF
+files it builds itself: a 70B at a 128k context, a sliding-window model, an
+architecture whose KV head count varies by layer, `key_length` != `value_length`,
+every cache type ggml quantizes to, a cache type it does not, and files
+truncated inside their own metadata - each of which would size a cache at zero
+under a reader that returned defaults, and zero always fits. The fixtures are
+sparse, so a 40 GiB model costs under 4 MiB of disk, which the suite asserts.
+
+### Configuration reader self-test
+
+Every script here decides what to do from a value `lib/env.sh` returned: where
+the model lives, which Compose file to merge, which image to run, how large the
+KV cache is. A reader that disagrees with Compose therefore does not produce a
+wrong *message* - it produces a consistent and wrong *view* of the deployment,
+in which every other check passes against a configuration the container never
+had.
+
+`.env` is Compose syntax, not shell, and the two disagree in more places than
+they look like they do. Each of these was found by asking Compose and comparing,
+and each was a real divergence before it was a test case:
+
+| Written in `.env` | Compose resolves | The reader used to resolve |
+|---|---|---|
+| `MODELS_DIR='${HOME}/models'` | the literal `${HOME}/models` (a named volume - the project is refused) | `/home/u/models`, so the model was downloaded where nothing mounts |
+| `export MODELS_DIR=/data/x` | `/data/x` | nothing - the key was dropped, so every script used `./models` |
+| `MODELS_DIR=` then spaces then `/data/x` | `/data/x` (leading spaces are trimmed) | the spaces stayed in the value, so a valid path was reported as an unmountable bare relative one |
+| `CTX_SIZE="4096" # tuned` | `4096` | `"4096"` |
+| `A="$$5"` | `$5` (`$$` is Compose's escape) | `$$5` |
+| `A="l1\nl2"` | two lines | `"l1` |
+| `A=${UNSET:?why}` | the project is refused, with the message | an empty string, silently |
+| `MODELS_DIR=/data/../x` | `/data/../x`, byte for byte | `/x` |
+
+The last two rows are the shape worth naming: a value can make Compose refuse to
+read the file *at all* (`${VAR:?}` with nothing set, an unterminated quote or
+`${`, a stray sentence whose first word contains a space). Nothing starts, and a
+reader that quietly invented a value for it would let the whole suite report on
+a configuration that never existed. `env_check` now returns that reason, and
+both `setup.sh` and `validate.sh` report it before anything else.
+
+`test-env-lib.sh` is therefore differential rather than expectation-based: for
+each way a value can be written it asks `docker compose config` what Compose
+resolves, asks the library the same question, and asserts the two strings match
+- including "the project cannot be read at all" as an answer. A hand-written
+expectation would only have pinned what I believed Compose does, which is how
+the divergences above survived four scripts and 500 assertions. `docker compose
+config` is client-side, so this needs no daemon, image, GPU, model or network;
+without the Compose CLI the differential half is skipped with the reason
+printed, and the unit half (the reason strings, `env_load`, and the bind-source
+rules) still runs.
+
 ### The validation suite's own self-test
 
-"44/44 green" is only worth something if a red condition actually turns a check
+"50/50 green" is only worth something if a red condition actually turns a check
 red. On healthy hardware every check reports PASS - which is also exactly what a
 check that *cannot* fail reports, and two of them could not: the "rejects
 clients that do not trust the CA" check passed against an nginx that was down
@@ -618,7 +730,11 @@ TLS stack will accept. It needs no GPU, Docker, model or network, and
 ├── docker-compose.jetson.yml   # Jetson overlay (CDI GPU passthrough)
 ├── scripts/
 │   ├── lib/
-│   │   └── env.sh              # Reading .env with compose's semantics
+│   │   ├── env.sh              # Reading .env with compose's semantics
+│   │   ├── mem.sh              # KV cache and footprint arithmetic
+│   │   └── gguf.py             # GGUF metadata reader (layers, heads, vocab)
+│   ├── test-fixtures/
+│   │   └── mkgguf.py           # Builds sparse GGUF files for the tests
 │   ├── setup.sh                # Bootstrap + .env/platform consistency check
 │   ├── test-setup.sh           # Hermetic tests for the bootstrap
 │   ├── detect-platform.sh      # Hardware detection + tuned defaults
@@ -630,6 +746,8 @@ TLS stack will accept. It needs no GPU, Docker, model or network, and
 │   ├── test-validate.sh        # Hermetic tests for the validation suite
 │   ├── test-detect-platform.sh # Hermetic tests for platform detection
 │   ├── test-compose.sh         # Hermetic tests for the compose files + nginx.conf
+│   ├── test-env-lib.sh         # Hermetic tests for the .env reader (vs compose)
+│   ├── test-mem.sh             # Hermetic tests for the memory sizing
 │   ├── benchmark.sh            # Throughput benchmark
 │   └── test-benchmark.sh       # Hermetic tests for the benchmark
 ├── models/                     # GGUF model files (git-ignored)

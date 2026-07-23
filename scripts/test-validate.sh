@@ -307,7 +307,19 @@ CFG_LEGACY=$'services:\n  llama-server:\n    deploy:\n      resources:\n        
 CFG_BOTH="${CFG_CDI}${CFG_LEGACY}"
 CFG_NONE=$'services:\n  llama-server:\n    image: stub\n'
 
-LOG_HEALTHY=$'ggml_cuda_init: found 1 CUDA devices:\nggml_cuda_init:   Device 0: Orin\nggml_cuda_init: GGML_CUDA_FORCE_MMQ: no\nload_backend: ARCHS = 870\nload_tensors: offloaded 29/29 layers to GPU\n'
+# The memory lines are the ones the sizing checks read back. 144.00 MiB is what
+# the fixture model (36 layers, 2048 embd, 16 heads, 2 KV heads) needs for the
+# 4096-token f16 cache healthy_env configures - so a healthy fixture is one
+# where llama.cpp and the prediction agree, exactly as on the real board.
+LOG_MEM=$'load_tensors:        CUDA0 model buffer size =  1834.83 MiB\nllama_kv_cache:      CUDA0 KV buffer size =   144.00 MiB\nsched_reserve:      CUDA0 compute buffer size =   304.75 MiB\n'
+LOG_HEALTHY=$'ggml_cuda_init: found 1 CUDA devices:\nggml_cuda_init:   Device 0: Orin\nggml_cuda_init: GGML_CUDA_FORCE_MMQ: no\nload_backend: ARCHS = 870\nload_tensors: offloaded 29/29 layers to GPU\n'"$LOG_MEM"
+# The same board reporting a cache that is not the predicted size: a build that
+# pads differently, a cache type that is not what .env asked for, an override
+# nobody remembered. The prediction is what the preflight check refuses
+# configurations on, so a disagreement has to be visible.
+LOG_KV_WRONG=$'ggml_cuda_init: found 1 CUDA devices:\nload_backend: ARCHS = 870\nload_tensors: offloaded 29/29 layers to GPU\nllama_kv_cache:      CUDA0 KV buffer size =   288.00 MiB\n'
+# A board whose whole allocation is past the budget the sizing checks trust.
+LOG_OVER_BUDGET=$'ggml_cuda_init: found 1 CUDA devices:\nload_backend: ARCHS = 870\nload_tensors: offloaded 29/29 layers to GPU\nload_tensors:        CUDA0 model buffer size =  5200.00 MiB\nllama_kv_cache:      CUDA0 KV buffer size =   144.00 MiB\nsched_reserve:      CUDA0 compute buffer size =   400.00 MiB\n'
 LOG_CPU=$'llama_model_loader: loaded meta data\nload_tensors: CPU model buffer size = 1918.35 MiB\n'
 LOG_NO_ARCHS=$'ggml_cuda_init: found 1 CUDA devices:\nload_backend: ARCHS = 750;800\nload_tensors: offloaded 29/29 layers to GPU\n'
 LOG_PTX=$'ggml_cuda_init: found 1 CUDA devices:\nload_backend: ARCHS = 870\nload_tensors: offloaded 29/29 layers to GPU\nggml-cuda.cu: the provided PTX was compiled with an unsupported toolchain.\n'
@@ -338,11 +350,18 @@ new_project() {
   make_model "$P" tiny.gguf 512
 }
 
-# A GGUF-shaped file of an arbitrary apparent size. Sparse, so a "model" larger
-# than the board's whole memory budget costs 4 KiB of disk.
-make_model() {  # $1=project $2=name $3=size MiB
-  printf 'GGUF\x03\x00\x00\x00' >"$1/models/$2"
-  truncate -s "$3M" "$1/models/$2"
+# A model of an arbitrary apparent size, with real metadata. Sparse, so a model
+# larger than the board's whole memory budget costs a few KiB of disk.
+#
+# The metadata has to be real now that the sizing checks read it: a file with
+# only the magic bytes is unsizeable, and every case here would report "cannot
+# size the KV cache" instead of the verdict it was written to test. The default
+# geometry is Qwen2.5 3B's, the model this repo recommends for an Orin Nano.
+make_model() {  # $1=project $2=name $3=size MiB [extra mkgguf args...]
+  local p="$1" name="$2" mib="$3"; shift 3
+  python3 "$SCRIPT_DIR/test-fixtures/mkgguf.py" "$p/models/$name" \
+    --arch qwen2 --layers 36 --embd 2048 --heads 16 --kv-heads 2 \
+    --ctx-train 32768 --vocab 512 --size-mib "$mib" "$@"
 }
 
 write_env() {  # $1=project, remaining args are KEY=VALUE lines
@@ -456,13 +475,49 @@ assert_pass "$OUT" "LLAMA_IMAGE is the image for this platform" "LLAMA_IMAGE sur
 assert_pass "$OUT" "model file present" "MODEL_FILE survives the CR"
 
 # ══════════════════════════════════════════════════════════════════
+case_start "An .env compose refuses to read at all"
+# ══════════════════════════════════════════════════════════════════
+# Not a wrong value - a value that stops compose reading the file, so nothing
+# starts. Reported as its own check, because otherwise every check below is a
+# verdict on a configuration only this script ever saw.
+new_project
+write_env "$P" "COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml" \
+               "LLAMA_IMAGE=$JETSON_IMAGE" "MODELS_DIR=./models" \
+               "MODEL_FILE=/models/tiny.gguf" "PARALLEL=1" \
+               'CTX_SIZE=${TUNE_ME:?pick a context size for this board}'
+run_jetson "$P" --preflight
+assert_exit "$RC" 1 "exits 1"
+assert_fail "$OUT" ".env is a file compose refuses to read" "reports the file as unreadable"
+assert_contains "$OUT" "TUNE_ME" "names the variable that is missing a value"
+assert_contains "$OUT" "pick a context size" "carries the author's own message"
+assert_contains "$OUT" "Summary" "still completes the run"
+
+new_project
+write_env "$P" "COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml" \
+               "LLAMA_IMAGE=$JETSON_IMAGE" "MODELS_DIR=./models" \
+               "MODEL_FILE=/models/tiny.gguf" "PARALLEL=1" \
+               "this line is a leftover note, not a setting"
+run_jetson "$P" --preflight
+assert_fail "$OUT" ".env is a file compose refuses to read" "a stray sentence is reported"
+assert_contains "$OUT" "key cannot contain a space" "names compose's own reason"
+
+# The same check must go green for a file compose is happy with.
+new_project
+write_env "$P" "COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml" \
+               "LLAMA_IMAGE=$JETSON_IMAGE" "MODELS_DIR=./models" \
+               "MODEL_FILE=/models/tiny.gguf" "PARALLEL=1"
+run_jetson "$P" --preflight
+assert_pass "$OUT" ".env is a file compose can read" "an ordinary .env is not reported"
+
+# ══════════════════════════════════════════════════════════════════
 case_start "Compose-legal .env values that are not shell-legal"
 # ══════════════════════════════════════════════════════════════════
 # Sourcing this file printed "for: command not found" and executed the command
 # substitution. Quotes, an inline comment and an unquoted value with spaces are
 # all things compose accepts and .env.example itself documents.
 new_project
-mkdir -p "$P/models sub"; printf 'GGUF\x03\x00\x00\x00' >"$P/models sub/tiny.gguf"
+mkdir -p "$P/models sub"
+python3 "$SCRIPT_DIR/test-fixtures/mkgguf.py" "$P/models sub/tiny.gguf" --vocab 512
 cat >"$P/.env" <<EOF
 COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml
 LLAMA_IMAGE="$JETSON_IMAGE"
@@ -502,7 +557,8 @@ assert_fail "$OUT" "must be a container path" "a host path in MODEL_FILE is reje
 # ══════════════════════════════════════════════════════════════════
 case_start "Model sizing against the board's memory budget"
 # ══════════════════════════════════════════════════════════════════
-# The Orin Nano Super sysroot gives a 5571 MiB budget. Weights larger than that
+# The Orin Nano Super sysroot (7620000 kB, minus the 2 GB OS reserve) gives a
+# 5393 MiB budget. Weights larger than that
 # fail at load; weights over 60% of it load and then die once the KV cache grows.
 new_project; healthy_env "$P" "MODEL_FILE=/models/huge.gguf"
 make_model "$P" huge.gguf 8000
@@ -518,7 +574,89 @@ assert_skip "$OUT" "% of the" "weights that fit but crowd the KV cache are flagg
 new_project; healthy_env "$P" "MODEL_FILE=/models/right.gguf"
 make_model "$P" right.gguf 2000
 run_jetson "$P" --preflight
-assert_pass "$OUT" "leave room for the KV cache" "a correctly sized model passes"
+assert_pass "$OUT" "KV cache" "a correctly sized model passes"
+
+# ── The KV cache is part of the size, and used not to be ─────────
+# The check this replaced looked at the file and nothing else, so the two
+# configurations below - identical models, contexts eight times apart - were
+# indistinguishable to it. Both went green; the second one cannot run.
+new_project; healthy_env "$P" "MODEL_FILE=/models/right.gguf" "CTX_SIZE=4096" \
+             "CACHE_TYPE_K=q8_0" "CACHE_TYPE_V=q8_0"
+make_model "$P" right.gguf 2000
+run_jetson "$P" --preflight
+assert_pass "$OUT" "4096-token q8_0/q8_0 KV cache 77" "the cache is sized from CTX_SIZE and the cache type"
+assert_contains "$OUT" "= 2077 MiB" "and added to the weights"
+
+new_project; healthy_env "$P" "MODEL_FILE=/models/right.gguf" "CTX_SIZE=131072" \
+             "CACHE_TYPE_K=q8_0" "CACHE_TYPE_V=q8_0"
+make_model "$P" right.gguf 2000
+run_jetson "$P" --preflight
+assert_skip "$OUT" "little room left for the compute buffers" \
+  "the same model at 131072 tokens is over the line"
+assert_contains "$OUT" "KV cache 2448" "the cache is larger than the weights"
+assert_contains "$OUT" "CTX_SIZE=" "the advice names a context that fits"
+
+# f16 is twice q8_0, which is the whole reason .env recommends q8_0 on a Jetson.
+new_project; healthy_env "$P" "MODEL_FILE=/models/right.gguf" "CTX_SIZE=65536" \
+             "CACHE_TYPE_K=f16" "CACHE_TYPE_V=f16"
+make_model "$P" right.gguf 2000
+run_jetson "$P" --preflight
+assert_contains "$OUT" "65536-token f16/f16 KV cache 2304" "an f16 cache is twice the size"
+assert_contains "$OUT" "CACHE_TYPE_K=q8_0" "the advice offers quantizing the cache"
+
+# A configuration that cannot start at all, which the file-size check called a
+# pass: the weights fit, and the weights plus the cache do not.
+new_project; healthy_env "$P" "MODEL_FILE=/models/mid.gguf" "CTX_SIZE=262144" \
+             "CACHE_TYPE_K=f16" "CACHE_TYPE_V=f16"
+make_model "$P" mid.gguf 3000
+run_jetson "$P" --preflight
+assert_fail "$OUT" "the configured deployment does not fit" "weights that fit with a cache that does not"
+assert_contains "$OUT" "cudaMalloc" "says what the failure will look like"
+
+# No context leaves room, so there is no context to suggest. The arithmetic
+# literally returns 0 here, and printing "CTX_SIZE=0 fits" would be advice that
+# cannot be taken.
+new_project; healthy_env "$P" "MODEL_FILE=/models/big.gguf" "CTX_SIZE=32768"
+make_model "$P" big.gguf 5000
+run_jetson "$P" --preflight
+assert_contains "$OUT" "no context leaves room on this board" "no usable context is said plainly"
+assert_not_contains "$OUT" "CTX_SIZE=0 fits" "and not as CTX_SIZE=0"
+
+# A cache type llama.cpp does not quantize to. Falling back to f16 would produce
+# a budget for a deployment that refuses to start.
+new_project; healthy_env "$P" "MODEL_FILE=/models/right.gguf" "CACHE_TYPE_K=q3_k"
+make_model "$P" right.gguf 2000
+run_jetson "$P" --preflight
+assert_fail "$OUT" "not a cache type llama.cpp quantizes to" "an unsupported cache type is caught"
+assert_contains "$OUT" "q3_k" "names the value"
+assert_contains "$OUT" "q8_0" "names one that works"
+
+# A model whose metadata cannot be read must not silently fall back to sizing on
+# the file: a cache of unknown size is not a cache of no size.
+new_project; healthy_env "$P" "MODEL_FILE=/models/broken.gguf"
+printf 'GGUF\x03\x00\x00\x00' >"$P/models/broken.gguf"; truncate -s 2000M "$P/models/broken.gguf"
+run_jetson "$P" --preflight
+assert_skip "$OUT" "cannot size the KV cache" "an unreadable model is reported, not assumed"
+assert_not_contains "$OUT" "leave room for the KV cache" "no verdict is invented for it"
+
+# ── The context the model was trained for ────────────────────────
+new_project; healthy_env "$P" "MODEL_FILE=/models/right.gguf" "CTX_SIZE=4096"
+make_model "$P" right.gguf 2000
+run_jetson "$P" --preflight
+assert_pass "$OUT" "within the model's trained context (32768)" "a context inside the trained one passes"
+
+new_project; healthy_env "$P" "MODEL_FILE=/models/short.gguf" "CTX_SIZE=8192"
+make_model "$P" short.gguf 2000 --ctx-train 4096
+run_jetson "$P" --preflight
+assert_skip "$OUT" "beyond this model's trained context (4096)" \
+  "a context past the trained one is surfaced"
+
+# ── A sliding-window model, whose cache is smaller than this sum ──
+new_project; healthy_env "$P" "MODEL_FILE=/models/swa.gguf" "CTX_SIZE=8192"
+make_model "$P" swa.gguf 2000 --arch gemma3 --sliding-window 1024
+run_jetson "$P" --preflight
+assert_pass "$OUT" "upper bound" "an SWA model's estimate is reported as a bound"
+assert_contains "$OUT" "sliding-window attention" "with the reason"
 
 # ══════════════════════════════════════════════════════════════════
 case_start "Disk hygiene"
@@ -709,6 +847,62 @@ run_jetson "$P" --runtime
 assert_pass "$OUT" "initialised a CUDA device" "finds the CUDA banner behind 2000 log lines"
 assert_pass "$OUT" "sm_87 kernels" "finds the ARCHS line behind 2000 log lines"
 assert_pass "$OUT" "all layers offloaded" "finds the offload line behind 2000 log lines"
+
+# ══════════════════════════════════════════════════════════════════
+case_start "Runtime: the KV cache against the size that was predicted"
+# ══════════════════════════════════════════════════════════════════
+# The preflight sizing check is arithmetic over the model's metadata, and
+# arithmetic nothing contradicts is a belief. llama.cpp prints what it actually
+# allocated, so the two are compared on every runtime run - which is what makes
+# the preflight number worth refusing a configuration on.
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "KV cache is the predicted size" "prediction and allocation agree"
+assert_contains "$OUT" "144.00 MiB allocated" "reports both numbers"
+assert_pass "$OUT" "loaded footprint is 2284 MiB" "totals every buffer the log reports"
+
+# --runtime alone runs no preflight, so the check has to redo the prediction
+# rather than read what preflight left behind. It used to be the only consumer
+# of a variable preflight set, which made it silently skip in this mode.
+assert_not_contains "$OUT" "cannot compare the KV cache" "the prediction is made in --runtime mode too"
+
+new_project; healthy_env "$P"
+printf '%s' "$LOG_KV_WRONG" >"$P/.dockerstub/logs.out"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "not the size the sizing check predicts" "a cache twice the predicted size is caught"
+assert_contains "$OUT" "288.00 MiB" "names what was allocated"
+assert_contains "$OUT" "do not trust its verdict" "says what the disagreement costs"
+
+# A build that prints no cache size at all: unverified is not the same as
+# verified, and must not be reported as a pass.
+new_project; healthy_env "$P"
+printf '%s' "$LOG_PARTIAL" >"$P/.dockerstub/logs.out"
+run_jetson "$P" --runtime
+assert_skip "$OUT" "no KV cache size reported in the log" "a build that prints none is a skip"
+assert_contains "$OUT" "unverified" "and says the prediction is unverified"
+
+# The model on disk cannot be sized, so there is nothing to compare against.
+new_project; healthy_env "$P" "MODEL_FILE=/models/opaque.gguf"
+printf 'GGUF\x03\x00\x00\x00' >"$P/models/opaque.gguf"
+run_jetson "$P" --runtime
+assert_skip "$OUT" "cannot compare the KV cache against the prediction" \
+  "an unsizeable model is a skip, not a pass"
+
+# An SWA model allocates less than the upper bound, which is agreement, not a
+# disagreement - the estimate said so in advance.
+new_project; healthy_env "$P" "MODEL_FILE=/models/swa.gguf" "CTX_SIZE=8192"
+make_model "$P" swa.gguf 500 --arch gemma3 --sliding-window 1024
+run_jetson "$P" --runtime
+assert_pass "$OUT" "smaller than the predicted upper bound" "an SWA model under its bound passes"
+
+# The budget every sizing verdict is derived from, checked against what the
+# server actually took. Over it, the stack still runs - and every preflight fit
+# verdict is unreliable, which is worth a red on its own.
+new_project; healthy_env "$P"
+printf '%s' "$LOG_OVER_BUDGET" >"$P/.dockerstub/logs.out"
+run_jetson "$P" --runtime
+assert_fail "$OUT" "past the 5393 MiB budget" "an allocation past the budget is caught"
+assert_contains "$OUT" "too optimistic" "names the budget as the thing at fault"
 
 # ══════════════════════════════════════════════════════════════════
 case_start "Runtime: the HTTP API"

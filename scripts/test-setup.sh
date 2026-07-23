@@ -418,6 +418,23 @@ run_setup "$P" "$JETSON_SYSROOT"
 assert_eq "$(envval "$P" MODEL_FILE)" "/models/crlf-model.gguf" \
   "a CRLF line ending is not part of the path"
 
+# A .env compose cannot read at all is a different failure from a wrong value:
+# nothing starts, and every item setup.sh reports below it is its own reading of
+# a file compose never accepted. It has to be named as an outstanding item.
+new_project
+run_setup "$P" "$JETSON_SYSROOT"
+printf 'CTX_SIZE=${TUNE_ME:?pick a context size}\n' >>"$P/.env"
+run_setup "$P" "$JETSON_SYSROOT"
+assert_contains "$OUT" ".env cannot be read by compose" "an unreadable .env is reported"
+assert_contains "$OUT" "TUNE_ME" "names the variable with no value"
+assert_not_contains "$OUT" "Setup complete" "does not claim the setup is finished"
+
+new_project
+run_setup "$P" "$JETSON_SYSROOT"
+printf 'a leftover note left in the file\n' >>"$P/.env"
+run_setup "$P" "$JETSON_SYSROOT"
+assert_contains "$OUT" ".env cannot be read by compose" "a stray line is reported"
+
 # A commented-out key must not win over the live one below it.
 new_project
 cp "$P/.env.example" "$P/.env"

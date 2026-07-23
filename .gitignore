@@ -12,3 +12,7 @@ docker-compose.override.yml
 
 # Python virtualenv
 .venv/
+
+# Python bytecode (the metadata reader and the fixture builder are scripts,
+# never imported, but an interpreter invoked as `python3 -m` still leaves this)
+__pycache__/

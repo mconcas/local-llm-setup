@@ -107,6 +107,16 @@ echo "==> Checking .env against this platform …"
 # in quotes does not) and on a bare relative path (a named volume to compose, an
 # ordinary directory to bash). Either disagreement puts the model somewhere the
 # container never reads.
+# A .env can be unreadable to compose rather than merely wrong - a ${VAR:?msg}
+# with nothing set, an unterminated quote, a stray sentence left in the file.
+# Report that first: every value below is this script's best-effort reading of a
+# file compose will not read at all.
+if ! ENV_WHY="$(env_check)"; then
+  mismatch ".env cannot be read by compose." \
+           "$ENV_WHY" \
+           "\`docker compose up\` fails before starting anything."
+fi
+
 MODEL_DIR_RAW="$(env_get MODELS_DIR)"
 MODEL_DIR_RAW="${MODEL_DIR_RAW:-./models}"
 if MODEL_DIR_HOST="$(env_bind_path "$MODEL_DIR_RAW" 2>/dev/null)"; then

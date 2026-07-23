@@ -49,7 +49,10 @@ else
   C_OK=""; C_NO=""; C_SK=""; C_HD=""; C_Z=""
 fi
 
-ok()   { PASS=$((PASS+1)); printf '  %sPASS%s  %s\n' "$C_OK" "$C_Z" "$1"; }
+# A PASS can carry advice too - an estimate that is an upper bound rather than a
+# number is still a pass, and the reason it is a bound is the useful half of it.
+ok()   { PASS=$((PASS+1)); printf '  %sPASS%s  %s\n' "$C_OK" "$C_Z" "$1"
+         detail "$@"; }
 # Every argument after the first is an advice line. They are printed, not just
 # the second: a `no` call with three lines of advice used to show two and drop
 # the last one silently, which is the wrong end of the message to lose.
@@ -68,6 +71,7 @@ head() { printf '\n%s%s%s\n' "$C_HD" "$1" "$C_Z"; }
 # an invisible CR. See lib/env.sh.
 ENV_FILE="$PROJECT_DIR/.env"
 . "$SCRIPT_DIR/lib/env.sh"
+. "$SCRIPT_DIR/lib/mem.sh"
 ENV_PROJECT_DIR="$PROJECT_DIR"   # compose resolves a relative bind source against this
 env_load
 
@@ -128,6 +132,56 @@ selftest() {
     no "$label self-test: ${nfail} assertion(s) failed" \
        "first: ${first:-see output}; run ./scripts/$script for the rest"
   fi
+}
+
+# model_metadata FILE - print the GGUF_* assignments for FILE, or print the
+# reader's reason and return 1. Memoised, because both the preflight sizing
+# check and the runtime differential check need the same fields and `--runtime`
+# skips the one that would have filled them in.
+MODEL_META=""; MODEL_META_FILE=""; MODEL_META_RC=0
+model_metadata() {
+  if [[ "$1" != "$MODEL_META_FILE" ]]; then
+    MODEL_META_FILE="$1"
+    MODEL_META_RC=0
+    MODEL_META="$(mem_model_read "$1" 2>&1)" || MODEL_META_RC=1
+  fi
+  printf '%s' "$MODEL_META"
+  return "$MODEL_META_RC"
+}
+
+# kv_predict - set KV_PREDICTED_MIB to the size llama.cpp will allocate for the
+# KV cache under the current .env, or KV_PREDICT_WHY to the reason it cannot be
+# known. Also leaves the model's GGUF_* fields in scope for the caller.
+#
+# One implementation for two callers on purpose: the preflight check refuses
+# configurations on this number and the runtime check compares it against what
+# llama.cpp actually allocated, so they have to be the same number. `--runtime`
+# runs the second without the first, which is why this does its own path
+# resolution rather than reading what preflight left behind.
+KV_PREDICTED_MIB=""; KV_PREDICT_WHY=""
+kv_predict() {
+  KV_PREDICTED_MIB=""; KV_PREDICT_WHY=""
+  local mfile="${MODEL_FILE:-}" host_model meta bytes dir
+  if [[ -z "$mfile" || "$mfile" != /models/* ]]; then
+    KV_PREDICT_WHY="MODEL_FILE is not set to a path under /models/"; return 1
+  fi
+  dir="${MODELS_DIR_HOST:-}"
+  if [[ -z "$dir" ]] && ! dir="$(env_bind_path "${MODELS_DIR:-./models}" 2>/dev/null)"; then
+    KV_PREDICT_WHY="MODELS_DIR is not a path compose can bind-mount"; return 1
+  fi
+  host_model="${dir}/${mfile#/models/}"
+  if [[ ! -f "$host_model" ]]; then
+    KV_PREDICT_WHY="no model file at $host_model"; return 1
+  fi
+  if ! meta="$(model_metadata "$host_model")"; then
+    KV_PREDICT_WHY="${meta:-the model metadata could not be read}"; return 1
+  fi
+  eval "$meta"
+  if ! bytes="$(mem_kv_bytes "${CTX_SIZE:-4096}" "$GGUF_K_ELEMS_PER_TOKEN" \
+                "$GGUF_V_ELEMS_PER_TOKEN" "${CACHE_TYPE_K:-f16}" "${CACHE_TYPE_V:-f16}" 2>&1)"; then
+    KV_PREDICT_WHY="$bytes"; return 1
+  fi
+  KV_PREDICTED_MIB="$(mem_mib "$bytes")"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -245,6 +299,18 @@ preflight() {
 
   head "Preflight - compose and model"
 
+  # Some .env constructs are not a bad value, they stop compose reading the file
+  # at all: ${VAR:?msg} with VAR unset, an unterminated quote or ${, a stray
+  # line whose first word contains a space. Nothing starts, and every check
+  # below would otherwise report on values only this script ever saw.
+  if env_fatal="$(env_check)"; then
+    ok ".env is a file compose can read"
+  else
+    no ".env is a file compose refuses to read" \
+       "$env_fatal" \
+       "nothing starts until this is fixed; the values reported below are this script's reading, not compose's"
+  fi
+
   if dc config >/dev/null 2>&1; then
     ok "compose config is valid (${COMPOSE_FILE:-docker-compose.yml})"
   else
@@ -300,22 +366,93 @@ preflight() {
 
   # A model that does not fit leaves the container in a crash loop with an
   # opaque cudaMalloc failure, so flag it here where the message can be useful.
+  #
+  # "Fits" is not a property of the file. The weights are one of three claims on
+  # the same pool, and on a Jetson that pool is also the system RAM: the KV
+  # cache is set by CTX_SIZE and CACHE_TYPE_K/V, and the compute buffers scale
+  # with the vocabulary. Sizing on the file alone answered a question nobody
+  # asked - it passed at 33% of budget for a configuration that would have
+  # needed 90% of it - so read the model's own metadata and do the arithmetic.
+  # Run the prediction before the checks that read it, not inside one of them:
+  # the trained-context check below needs the model's metadata and has nothing
+  # to do with the budget, and a CPU-only host has no budget at all.
+  [[ -f "$host_model" ]] && { kv_predict || true; }
+
   if [[ -f "$host_model" && -n "${GPU_MEM_MB:-}" ]] && (( GPU_MEM_MB > 0 )); then
     local model_mb model_pct
     model_mb=$(( $(stat -c %s "$host_model") / 1048576 ))
     model_pct=$(( model_mb * 100 / GPU_MEM_MB ))
+
     if (( model_mb >= GPU_MEM_MB )); then
+      # No cache arithmetic can rescue this one, and reading the metadata of a
+      # model that cannot load is noise on top of the answer.
       no "model weights (${model_mb} MiB) exceed the ${GPU_MEM_MB} MiB budget" \
          "expect an out-of-memory failure at load; try ${REC_MODEL_FILE:-a smaller quant}"
-    elif (( model_pct > 60 )); then
-      # Weights fitting is not enough: the KV cache, the compute buffers and
-      # llama.cpp's scratch space come out of the same budget. A model at this
-      # ratio loads and then dies once a long prompt grows the cache, which is
-      # far harder to diagnose than a failure at load.
-      skip "model weights take ${model_pct}% of the ${GPU_MEM_MB} MiB budget" \
-           "little room left for a ${CTX_SIZE:-?}-token KV cache; lower CTX_SIZE or use ${REC_MODEL_FILE:-a smaller quant}"
+    elif [[ -z "$KV_PREDICTED_MIB" ]]; then
+      case "$KV_PREDICT_WHY" in
+        "unknown KV cache type"*)
+          no "CACHE_TYPE_K/V is not a cache type llama.cpp quantizes to" \
+             "$KV_PREDICT_WHY" \
+             "use f16 (no quantization) or q8_0 (half the size, the usual choice on a Jetson)" ;;
+        *)
+          # Cannot size it, so say that rather than fall back to the file-size
+          # check whose verdict is what this replaced.
+          skip "cannot size the KV cache for this model" \
+               "${KV_PREDICT_WHY:-the model metadata could not be read}" \
+               "weights alone are ${model_mb} MiB, ${model_pct}% of the ${GPU_MEM_MB} MiB budget" ;;
+      esac
     else
-      ok "model weights (${model_mb} MiB, ${model_pct}% of budget) leave room for the KV cache"
+      local ctx="${CTX_SIZE:-4096}" tk="${CACHE_TYPE_K:-f16}" tv="${CACHE_TYPE_V:-f16}"
+      local total_mib=$(( model_mb + KV_PREDICTED_MIB ))
+      local total_pct=$(( total_mib * 100 / GPU_MEM_MB ))
+      local what="weights ${model_mb} + ${ctx}-token ${tk}/${tv} KV cache ${KV_PREDICTED_MIB} = ${total_mib} MiB, ${total_pct}% of the ${GPU_MEM_MB} MiB budget"
+      # The compute buffers and the allocator's own overhead are deliberately
+      # not modelled - their size is a property of the llama.cpp build, and a
+      # guess here would be a number that looks exact and is not. The runtime
+      # check reports them from the log instead; what the budget has to leave
+      # for them is the quarter this threshold keeps free.
+      local room_bytes=$(( (GPU_MEM_MB * 75 / 100 - model_mb) * 1048576 ))
+      local fit_ctx=0
+      (( room_bytes > 0 )) && fit_ctx="$(mem_max_ctx "$room_bytes" \
+          "$GGUF_K_ELEMS_PER_TOKEN" "$GGUF_V_ELEMS_PER_TOKEN" "$tk" "$tv")"
+      # A model can be past the line before it has a cache at all, and then
+      # there is no context to suggest. Saying "CTX_SIZE=0 fits" - which is what
+      # the arithmetic literally returns - would be advice that cannot be taken.
+      local advice
+      if (( fit_ctx > 0 )); then
+        advice="CTX_SIZE=${fit_ctx} fits with this model and cache type"
+        [[ "$tk" != q8_0 || "$tv" != q8_0 ]] &&
+          advice+=", or CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 to halve the cache"
+      else
+        advice="no context leaves room on this board: use ${REC_MODEL_FILE:-a smaller quant}"
+      fi
+      if (( total_mib >= GPU_MEM_MB )); then
+        no "the configured deployment does not fit: $what" \
+           "expect a cudaMalloc failure at load" \
+           "$advice"
+      elif (( total_pct > 75 )); then
+        skip "little room left for the compute buffers: $what" \
+             "the compute buffers and allocator overhead come out of the same pool and are not in that total" \
+             "$advice"
+      elif [[ -n "${GGUF_ESTIMATE_CAVEAT:-}" ]]; then
+        # An upper bound is still a useful answer, but it must not be reported
+        # as the number: an SWA or MLA model needs less than this arithmetic.
+        ok "$what (upper bound)" "${GGUF_ESTIMATE_CAVEAT}"
+      else
+        ok "$what"
+      fi
+    fi
+  fi
+
+  # CTX_SIZE beyond what the model was trained for is not an error to llama.cpp
+  # - it extends the rope and the output degrades - so it is the kind of thing
+  # that gets configured once and blamed on the quantization later.
+  if [[ -n "${GGUF_N_CTX_TRAIN:-}" ]] && (( GGUF_N_CTX_TRAIN > 0 )); then
+    if (( ${CTX_SIZE:-4096} > GGUF_N_CTX_TRAIN )); then
+      skip "CTX_SIZE=${CTX_SIZE:-4096} is beyond this model's trained context (${GGUF_N_CTX_TRAIN})" \
+           "llama.cpp will serve it, but quality past ${GGUF_N_CTX_TRAIN} tokens is not what the model was trained for"
+    else
+      ok "CTX_SIZE=${CTX_SIZE:-4096} is within the model's trained context (${GGUF_N_CTX_TRAIN})"
     fi
   fi
 
@@ -418,6 +555,26 @@ preflight() {
   # merged config for both platforms and runs the real nginx.conf.
   selftest test-compose.sh "deployment configuration"
 
+  head "Preflight - configuration reader"
+
+  # Every script here decides what to do from what lib/env.sh returns, so a
+  # reader that disagrees with compose does not produce a wrong message - it
+  # produces a consistent and wrong view of the deployment, in which every check
+  # passes against a configuration the container never had. The self-test is
+  # differential: it asks `docker compose config` the same question for each way
+  # a value can be written and asserts the two answers match.
+  selftest test-env-lib.sh "configuration reader"
+
+  head "Preflight - memory sizing"
+
+  # The sizing checks above refuse configurations on a number, and a number is
+  # the one kind of answer that can be confidently wrong. This covers what this
+  # board cannot demonstrate - a 70B at a 128k context, a sliding-window model,
+  # per-layer KV head counts, a cache type llama.cpp does not quantize to - and
+  # the runtime check compares the same arithmetic against what llama.cpp
+  # actually allocated.
+  selftest test-mem.sh "memory sizing"
+
   head "Preflight - benchmark"
 
   # A healthy stack only ever exercises the benchmark's happy path, so the ways
@@ -518,7 +675,6 @@ runtime() {
   fi
 
   local offl; offl="$(grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' "$logfile" | tail -1)"
-  rm -f "$logfile"
   if [[ -n "$offl" ]]; then
     local n d; n="${offl#offloaded }"; n="${n%%/*}"; d="${offl#*/}"; d="${d%% *}"
     if [[ "$n" == "$d" ]]; then
@@ -528,6 +684,68 @@ runtime() {
     fi
   else
     skip "no layer-offload line found in the log"
+  fi
+
+  head "Runtime - memory footprint"
+
+  # The preflight sizing check is arithmetic over the model's metadata, and
+  # arithmetic that nothing contradicts is a belief. llama.cpp prints the size
+  # it actually allocated for the KV cache, so compare the two on every run: if
+  # they diverge, the number the preflight check refuses configurations on is
+  # wrong, and that is worth a red long before a user hits it as an OOM.
+  local kv_obs kv_obs_mib
+  kv_obs="$(grep -oE 'KV (self size|buffer size) *= *[0-9]+\.[0-9]+ MiB' "$logfile" \
+            | grep -oE '[0-9]+\.[0-9]+' | awk '{s+=$1} END {if (NR) printf "%.2f", s}')"
+  if [[ -z "${KV_PREDICTED_MIB:-}" ]]; then
+    # --runtime skips the preflight that fills this in; redo it here rather than
+    # skip the only check that can falsify the prediction.
+    kv_predict
+  fi
+  if [[ -z "${KV_PREDICTED_MIB:-}" ]]; then
+    skip "cannot compare the KV cache against the prediction" \
+         "${KV_PREDICT_WHY:-the model metadata could not be read}"
+  elif [[ -z "$kv_obs" ]]; then
+    skip "no KV cache size reported in the log" \
+         "this llama.cpp build does not print one; the ${KV_PREDICTED_MIB} MiB prediction is unverified"
+  else
+    kv_obs_mib="${kv_obs%%.*}"
+    # 2%: the prediction is exact arithmetic, and the only legitimate difference
+    # is the allocator's own padding (0.03 MiB on this board). A percent-level
+    # gap means a real disagreement - a build that pads the cache differently, a
+    # cache type that is not what .env asked for, an SWA model.
+    local kv_delta=$(( kv_obs_mib - KV_PREDICTED_MIB ))
+    (( kv_delta < 0 )) && kv_delta=$(( -kv_delta ))
+    if (( KV_PREDICTED_MIB > 0 && kv_delta * 100 / KV_PREDICTED_MIB <= 2 )); then
+      ok "KV cache is the predicted size (${kv_obs} MiB allocated, ${KV_PREDICTED_MIB} MiB predicted)"
+    elif [[ -n "${GGUF_ESTIMATE_CAVEAT:-}" ]] && (( kv_obs_mib < KV_PREDICTED_MIB )); then
+      ok "KV cache is smaller than the predicted upper bound (${kv_obs} MiB allocated, ${KV_PREDICTED_MIB} MiB predicted)" \
+         "${GGUF_ESTIMATE_CAVEAT}"
+    else
+      no "the KV cache is not the size the sizing check predicts" \
+         "llama.cpp allocated ${kv_obs} MiB; the preflight check predicted ${KV_PREDICTED_MIB} MiB" \
+         "the preflight budget arithmetic is wrong for this model or build - do not trust its verdict"
+    fi
+  fi
+
+  # What the server actually took, from its own accounting: every buffer it
+  # reports, which on a Jetson all come out of the one pool the CPU also uses.
+  # A total over the budget does not mean the stack is broken - it is running -
+  # it means detect-platform.sh's budget is optimistic, and every sizing verdict
+  # derived from it is unreliable.
+  local alloc_mib
+  alloc_mib="$(grep -oE '(model|KV|compute|output) buffer size *= *[0-9]+\.[0-9]+ MiB' "$logfile" \
+               | grep -oE '[0-9]+\.[0-9]+' | awk '{s+=$1} END {if (NR) printf "%.0f", s}')"
+  rm -f "$logfile"
+  if [[ -z "$alloc_mib" ]]; then
+    skip "the log reports no buffer sizes to total up"
+  elif [[ -z "${GPU_MEM_MB:-}" ]] || (( GPU_MEM_MB <= 0 )); then
+    skip "no memory budget to compare the ${alloc_mib} MiB allocation against"
+  elif (( alloc_mib >= GPU_MEM_MB )); then
+    no "the loaded model holds ${alloc_mib} MiB, past the ${GPU_MEM_MB} MiB budget the sizing checks use" \
+       "the stack is running, but detect-platform.sh's budget is too optimistic for this board" \
+       "the preflight fit verdicts are unreliable until it is corrected"
+  else
+    ok "loaded footprint is ${alloc_mib} MiB, $(( alloc_mib * 100 / GPU_MEM_MB ))% of the ${GPU_MEM_MB} MiB budget"
   fi
 
   head "Runtime - HTTP API"
