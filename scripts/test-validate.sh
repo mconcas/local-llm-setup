@@ -180,8 +180,12 @@ class H(BaseHTTPRequestHandler):
         # llama.cpp's JSON writer renders a NaN logit as null, but a build that
         # emits the literal has to be rejected too, so both spellings are
         # reachable: null straight through, "nan" via this substitution.
-        lps = [float("nan") if v == "nan" else v
-               for v in c.get("logprobs", [-0.07, -3.2, -3.4, -3.5, -3.6])]
+        raw = c.get("logprobs", [-0.07, -3.2, -3.4, -3.5, -3.6])
+        # A kernel that is wrong only on some calls answers the repeat probe
+        # with a different set entirely, which no single call can reveal.
+        if n > 0 and c.get("logprobs_next") is not None:
+            raw = c["logprobs_next"]
+        lps = [float("nan") if v == "nan" else v for v in raw]
         if c.get("drift") and n > 0:
             # drift_delta in nats: the default is a gap no reduction-order
             # difference produces, a small one is the CUDA noise the check has
@@ -1137,6 +1141,19 @@ assert_skip "$OUT" "how peaked the distribution is" "peakedness is skipped, not 
 # Both calls report the log-probability as 0 because neither could be read, and
 # comparing two of those is agreement by construction.
 assert_skip "$OUT" "cannot judge determinism" "determinism is skipped, not passed on two unread numbers"
+
+# A kernel that is wrong only sometimes answers the first call with numbers and
+# the second with a NaN. Every check above reads the first call only, so this is
+# the one place the defect is visible - and a skip here would leave the run
+# green against a board that produced a NaN on one of two identical requests.
+set_ctl '{"model_name":"/models/tiny.gguf","slots":1,
+          "logprobs_next":["nan",-3.2,-3.4,-3.5,-3.6]}'
+new_project; healthy_env "$P"
+run_jetson "$P" --runtime
+assert_pass "$OUT" "token distribution is well formed" "the first call looks healthy"
+assert_fail "$OUT" "same request twice gave different results" "an intermittent NaN is caught"
+assert_contains "$OUT" "the second of two identical calls" "names the call that broke"
+assert_exit "$RC" 1 "and the run goes red"
 
 # llama.cpp's JSON writer renders a NaN as null rather than as the literal, so
 # the same defect arrives in two spellings and both have to go red.

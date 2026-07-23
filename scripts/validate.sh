@@ -1108,11 +1108,19 @@ runtime() {
     if probe2="$(probe_run 2>&1)" && grep -q '^PROBE_FINITE=' <<<"$probe2"; then
       probe_load "$probe2"
       du=$(( PROBE_LOGPROB_U - u1 )); (( du < 0 )) && du=$(( -du ))
-      if (( ! f1 )) || (( ! PROBE_FINITE )); then
+      if (( ! f1 && ! PROBE_FINITE )); then
         # PROBE_LOGPROB_U is 0 whenever the probe could not read a number, so a
         # server returning NaN on both calls compares two fabricated zeros and
         # reports agreement. That is a check that cannot fail, not a pass.
         skip "cannot judge determinism - the log-probabilities are not numbers"
+      elif (( ! f1 || ! PROBE_FINITE )); then
+        # One of the two answered with a number and the other did not, which is
+        # the disagreement this check exists to find - and the only shape of it
+        # the checks above cannot see, since they only ever read the first call.
+        local nan_call="the first"; (( f1 )) && nan_call="the second"
+        no "the same request twice gave different results" \
+           "${nan_call} of two identical calls reported a log-probability that is not a finite number" \
+           "a kernel that is wrong only on some calls is the corruption this check repeats the request to catch"
       elif [[ "$PROBE_EMITTED" == "$t1" ]] && (( du <= PROBE_LOGPROB_TOL_U )); then
         ok "the same request twice gives the same token and the same log-probability (within ${PROBE_LOGPROB_TOL_U}e-6)"
       else
