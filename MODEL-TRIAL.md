@@ -21,7 +21,7 @@ regressed **-49.2 points** overall by ignoring the deployed skill's routing.
 | Overall | **89.7 %** (113/126), band 83.3 - 97.6 % | **40.5 %** (17/42) |
 | Tool-call-template failures | 9 / 126 (7.1 %) | **0 / 42 (0 %)** |
 | Substantive misses | 4 / 126 (3.2 %) | **25 / 42 (59.5 %)** |
-| Mean tool calls / question | 2.40 | 6.69 |
+| Mean tool calls / question (gateway-reported `agent.tool_calls`) | 2.40 | 6.69 |
 | Wall-clock per 42-question run | 307.9 s | 1019.3 s |
 
 The gap is ~50 points against a measured run-to-run spread of ±7 points. No plausible
@@ -48,7 +48,7 @@ one endpoint call and little discipline, hold up comparatively well.
 
 ### Per-difficulty and cost
 
-| Model | easy | medium | hard | used a data tool | hallucinations | mean tool calls | wall-clock / run |
+| Model | easy | medium | hard | used a data tool | hallucinations | mean `agent.tool_calls` | wall-clock / run |
 |---|---|---|---|---|---|---|---|
 | Incumbent | 94.4 % (17/18) | 87.3 % (55/63) | 91.1 % (41/45) | 117/126 (92.9 %) | 0 | 2.40 | 307.9 s |
 | Candidate | 83.3 % (5/6) | 33.3 % (7/21) | 33.3 % (5/15) | 42/42 (100 %) | 0 | 6.69 | 1019.3 s |
@@ -201,10 +201,19 @@ original 23.8 % baseline, and routing around it is most of what the tuning bough
 
 The two models obey that rule to completely different degrees:
 
-| | Questions touching `SearchIndexTool` | Questions using `exec` | `SearchIndexTool` calls | `exec` calls |
+| | Questions touching `SearchIndexTool` | Questions using `exec` | `SearchIndexTool` trace entries | `exec` trace entries |
 |---|---|---|---|---|
 | Incumbent (126 q) | 5 (4.0 %) | 104 (82.5 %) | 14 | 264 |
 | Candidate (42 q) | **27 (64.3 %)** | 9 (21.4 %) | **356** | 10 |
+
+The raw counts in the last two columns are `agent.tool_trace` entries from the session
+JSONL, a different measurement from the gateway-reported `agent.tool_calls` mean in the cost
+tables above, so the two do not reconcile by multiplication. Both are run-1-only figures for
+the candidate: 281 `agent.tool_calls` (mean 6.69) against 382 trace entries (mean 9.10, of
+which 356 `SearchIndexTool`, 10 `exec`, 16 other). They agree on 39 of 42 questions and
+diverge on exactly three, all runaway loops: `telegraf-error-jul20` (9 vs 68),
+`xindex-total-three-streams-jul20` (1 vs 28) and `aliecs-loglevels-jul20` (2 vs 17). The
+per-question share columns are unaffected by the choice of metric.
 
 A worked example - `nginx-total-jul20`, oracle `557513`:
 
@@ -289,8 +298,9 @@ rather than the expected end result.
 - The candidate GGUF is left in `models/` (17.28 GiB). It is not referenced by any config
   and can be deleted; it is kept so the trial can be re-run without a re-download.
 - **No tracked example config or documentation was changed**, which is the correct outcome
-  for a negative result. `.env.example` and `local-claw/config/openclaw.example.json` still
-  reference the incumbent.
+  for a negative result: the diff is this report plus the project-memory notes it produced.
+  The trial touched only gitignored deployment state, so nothing it did needs unwinding in
+  version control.
 
 ## Reproducing
 
