@@ -297,10 +297,14 @@ rather than the expected end result.
     The retry succeeded. The ceiling is still there, and it is still stochastic.
 - The candidate GGUF is left in `models/` (17.28 GiB). It is not referenced by any config
   and can be deleted; it is kept so the trial can be re-run without a re-download.
-- **No tracked example config or documentation was changed**, which is the correct outcome
-  for a negative result: the diff is this report plus the project-memory notes it produced.
-  The trial touched only gitignored deployment state, so nothing it did needs unwinding in
-  version control.
+- **No model default and no model reference was changed anywhere**, which is the correct
+  outcome for a negative result and the first thing to check: `.env.example` still carries
+  its generic `MODEL_FILE` placeholder and `local-claw`'s example config still names the
+  incumbent. The branch's tracked edits are this report, the project-memory notes, and two
+  incidental documentation-drift fixes to `README.md` and `.env.example` - undocumented
+  KV-cache knobs and a stale `DEBUG_PORT` - that the trial surfaced but did not cause. The
+  trial itself touched only gitignored deployment state, so nothing it did needs unwinding
+  in version control.
 
 ## Reproducing
 
