@@ -51,13 +51,19 @@ curl --cacert certs/ca.crt https://localhost:8443/v1/models
 
 All settings live in `.env` (created from `.env.example` by the setup script):
 
-| Variable     | Default              | Description                              |
-|-------------|----------------------|------------------------------------------|
-| `MODEL_FILE` | `/models/model.gguf` | Path to model inside the container       |
-| `CTX_SIZE`   | `4096`               | Context window size (tokens)             |
-| `GPU_LAYERS` | `-1`                 | Layers offloaded to GPU (`-1` = all)     |
-| `PARALLEL`   | `4`                  | Concurrent request slots                 |
-| `HTTPS_PORT` | `8443`               | Port exposed for HTTPS                   |
+| Variable       | Default              | Description                               |
+|----------------|----------------------|-------------------------------------------|
+| `MODEL_FILE`   | `/models/model.gguf` | Path to model inside the container        |
+| `CTX_SIZE`     | `4096`               | Context window size (tokens)              |
+| `GPU_LAYERS`   | `-1`                 | Layers offloaded to GPU (`-1` = all)      |
+| `PARALLEL`     | `4`                  | Concurrent request slots                  |
+| `HTTPS_PORT`   | `8443`               | Port exposed for HTTPS                    |
+| `CACHE_TYPE_K` | `f16`                | KV-cache key quantisation (e.g. `q8_0`)   |
+| `CACHE_TYPE_V` | `f16`                | KV-cache value quantisation (e.g. `q8_0`) |
+
+`CACHE_TYPE_K` / `CACHE_TYPE_V` set the KV-cache quantisation. Setting both to
+`q8_0` is what makes a large `CTX_SIZE` (e.g. `65536`) fit alongside Q4_K_M
+weights on a 32 GB GPU.
 
 ## OpenAI-Compatible API
 
@@ -127,6 +133,11 @@ Things to keep in mind when wiring it into an agent system:
   function-calling fidelity also depends on the model's chat template being
   applied correctly — sanity-check with a tool-calling probe before relying on
   it.
+- **A passing tool-call probe does not predict agent accuracy.** Once an agent's
+  prompts or skills have been tuned against one model, swapping in another can
+  regress it badly even when the newcomer's tool calling is mechanically better.
+  Benchmark before changing `MODEL_FILE` on a working agent deployment;
+  [MODEL-TRIAL.md](MODEL-TRIAL.md) records a measured case.
 - **Respect VRAM limits.** For a 32 GB GPU, Q4_K_M quantisations up to ~32B fit
   with full GPU offload; 70B-class models will spill to CPU and be slow.
 - **`PARALLEL` caps agent fan-out.** If your agent dispatches many concurrent
