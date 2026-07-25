@@ -127,6 +127,11 @@ Things to keep in mind when wiring it into an agent system:
   function-calling fidelity also depends on the model's chat template being
   applied correctly — sanity-check with a tool-calling probe before relying on
   it.
+- **A passing tool-call probe does not predict agent accuracy.** Once an agent's
+  prompts or skills have been tuned against one model, swapping in another can
+  regress it badly even when the newcomer's tool calling is mechanically better.
+  Benchmark before changing `MODEL_FILE` on a working agent deployment;
+  [MODEL-TRIAL.md](MODEL-TRIAL.md) records a measured case.
 - **Respect VRAM limits.** For a 32 GB GPU, Q4_K_M quantisations up to ~32B fit
   with full GPU offload; 70B-class models will spill to CPU and be slow.
 - **`PARALLEL` caps agent fan-out.** If your agent dispatches many concurrent
