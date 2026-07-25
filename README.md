@@ -51,13 +51,19 @@ curl --cacert certs/ca.crt https://localhost:8443/v1/models
 
 All settings live in `.env` (created from `.env.example` by the setup script):
 
-| Variable     | Default              | Description                              |
-|-------------|----------------------|------------------------------------------|
-| `MODEL_FILE` | `/models/model.gguf` | Path to model inside the container       |
-| `CTX_SIZE`   | `4096`               | Context window size (tokens)             |
-| `GPU_LAYERS` | `-1`                 | Layers offloaded to GPU (`-1` = all)     |
-| `PARALLEL`   | `4`                  | Concurrent request slots                 |
-| `HTTPS_PORT` | `8443`               | Port exposed for HTTPS                   |
+| Variable       | Default              | Description                               |
+|----------------|----------------------|-------------------------------------------|
+| `MODEL_FILE`   | `/models/model.gguf` | Path to model inside the container        |
+| `CTX_SIZE`     | `4096`               | Context window size (tokens)              |
+| `GPU_LAYERS`   | `-1`                 | Layers offloaded to GPU (`-1` = all)      |
+| `PARALLEL`     | `4`                  | Concurrent request slots                  |
+| `HTTPS_PORT`   | `8443`               | Port exposed for HTTPS                    |
+| `CACHE_TYPE_K` | `f16`                | KV-cache key quantisation (e.g. `q8_0`)   |
+| `CACHE_TYPE_V` | `f16`                | KV-cache value quantisation (e.g. `q8_0`) |
+
+`CACHE_TYPE_K` / `CACHE_TYPE_V` set the KV-cache quantisation. Setting both to
+`q8_0` is what makes a large `CTX_SIZE` (e.g. `65536`) fit alongside Q4_K_M
+weights on a 32 GB GPU.
 
 ## OpenAI-Compatible API
 
