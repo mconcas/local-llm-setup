@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gen-certs.sh — Generate a self-signed CA + server certificate for TLS.
+# gen-certs.sh - Generate a self-signed CA + server certificate for TLS.
 #
 # Usage:
 #   ./scripts/gen-certs.sh [HOSTNAME_OR_IP ...]
@@ -78,10 +78,10 @@ chmod 644 "$CERT_DIR"/*.crt
 
 echo ""
 echo "✔ Certificates written to $CERT_DIR/"
-echo "  ca.crt       — CA certificate (distribute to clients)"
-echo "  ca.key       — CA private key (keep secret)"
-echo "  server.crt   — Server certificate"
-echo "  server.key   — Server private key"
+echo "  ca.crt       - CA certificate (distribute to clients)"
+echo "  ca.key       - CA private key (keep secret)"
+echo "  server.crt   - Server certificate"
+echo "  server.key   - Server private key"
 echo ""
 echo "On client machines, trust the CA with:"
 echo "  curl --cacert certs/ca.crt https://<server>:8443/v1/models"

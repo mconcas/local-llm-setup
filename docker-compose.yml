@@ -1,31 +1,27 @@
 services:
   # ── llama.cpp server (CUDA) ──────────────────────────────────────
   llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
     container_name: llama-server
     restart: unless-stopped
     volumes:
-      - ./models:/models:ro
+      - ${MODELS_DIR:-./models}:/models:ro
       - ./templates:/templates:ro
     environment:
-      # These are passed as CLI args by the entrypoint
+      # LLAMA_ARG_* variables are read by llama-server as CLI arguments.
       LLAMA_ARG_MODEL: ${MODEL_FILE:-/models/model.gguf}
       LLAMA_ARG_CTX_SIZE: ${CTX_SIZE:-4096}
       LLAMA_ARG_N_GPU_LAYERS: ${GPU_LAYERS:--1}
       LLAMA_ARG_PARALLEL: ${PARALLEL:-4}
       LLAMA_ARG_HOST: "0.0.0.0"
       LLAMA_ARG_PORT: "8080"
-      # Quantize the KV cache to fit a larger context window in VRAM.
       LLAMA_ARG_CACHE_TYPE_K: ${CACHE_TYPE_K:-f16}
       LLAMA_ARG_CACHE_TYPE_V: ${CACHE_TYPE_V:-f16}
-      # Use the chat template embedded in the GGUF so OpenAI-style tool calls
-      # are parsed into structured `tool_calls` blocks (required for agentic clients).
+      # Apply the GGUF chat template so tool calls are parsed into structured
+      # `tool_calls` blocks. To override the template, set
+      # LLAMA_ARG_CHAT_TEMPLATE_FILE to a file under the mounted /templates.
       LLAMA_ARG_JINJA: "1"
-      # To override the GGUF-embedded chat template, create docker-compose.override.yml
-      # with:  services: { llama-server: { environment: { LLAMA_ARG_CHAT_TEMPLATE_FILE: /templates/your.jinja } } }
-      # (templates/ is mounted read-only at /templates inside the container)
-    # Expose the raw HTTP port only on localhost (not to the network).
-    # For network access, use the nginx HTTPS proxy below.
+    # Raw HTTP on localhost only; network access goes through nginx.
     ports:
       - "127.0.0.1:8080:8080"
     deploy:

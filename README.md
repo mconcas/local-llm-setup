@@ -60,10 +60,12 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `HTTPS_PORT`   | `8443`               | Port exposed for HTTPS                    |
 | `CACHE_TYPE_K` | `f16`                | KV-cache key quantisation (e.g. `q8_0`)   |
 | `CACHE_TYPE_V` | `f16`                | KV-cache value quantisation (e.g. `q8_0`) |
+| `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
+| `MODELS_DIR`   | `./models`           | Host directory bind-mounted at `/models`  |
+| `COMPOSE_FILE` | (unset)              | Extra compose files, e.g. the Jetson override |
 
-`CACHE_TYPE_K` / `CACHE_TYPE_V` set the KV-cache quantisation. Setting both to
-`q8_0` is what makes a large `CTX_SIZE` (e.g. `65536`) fit alongside Q4_K_M
-weights on a 32 GB GPU.
+Setting both cache types to `q8_0` halves KV-cache memory; this is what lets
+`CTX_SIZE=65536` fit alongside Q4_K_M weights on a 32 GB GPU.
 
 ## OpenAI-Compatible API
 
@@ -111,7 +113,7 @@ Point the client at:
 
 ```
 Base URL:  https://<server-ip>:8443/v1
-API Key:   (leave empty or use any string — no API key auth is enforced)
+API Key:   (leave empty or use any string - no API key auth is enforced)
 ```
 
 If the client doesn't support custom CA certs, either:
@@ -121,30 +123,49 @@ If the client doesn't support custom CA certs, either:
 
 ### Using as the backend for an agent framework
 
-This stack is suitable as the LLM backend for agent projects (MCP, LangChain,
-LlamaIndex, OpenAI SDK, custom tool-calling loops) — any client that accepts a
-custom `base_url` + (dummy) API key can point at the HTTPS endpoint above.
+Any client that accepts a custom `base_url` and a dummy API key (OpenAI SDK,
+LangChain, MCP servers, custom tool-calling loops) can use the HTTPS endpoint
+above.
 
-Things to keep in mind when wiring it into an agent system:
-
-- **Pick a model trained for tool/function calling.** Generic chat models often
-  fail multi-step agent loops. Good local choices: Qwen2.5-Instruct,
-  Llama-3.1-Instruct, Hermes, Mistral-Nemo-Instruct. llama.cpp's
-  function-calling fidelity also depends on the model's chat template being
-  applied correctly — sanity-check with a tool-calling probe before relying on
-  it.
-- **A passing tool-call probe does not predict agent accuracy.** Once an agent's
-  prompts or skills have been tuned against one model, swapping in another can
-  regress it badly even when the newcomer's tool calling is mechanically better.
-  Benchmark before changing `MODEL_FILE` on a working agent deployment;
+- Use a model trained for tool/function calling, and verify with a
+  tool-calling probe before relying on it; correct parsing also depends on the
+  model's chat template being applied (see `LLAMA_ARG_JINJA` in
+  `docker-compose.yml`).
+- Do not change `MODEL_FILE` on a working agent deployment without re-running
+  its benchmark: prompts tuned against one model can regress badly on another
+  even when the new model's tool calling is mechanically better.
   [MODEL-TRIAL.md](MODEL-TRIAL.md) records a measured case.
-- **Respect VRAM limits.** For a 32 GB GPU, Q4_K_M quantisations up to ~32B fit
-  with full GPU offload; 70B-class models will spill to CPU and be slow.
-- **`PARALLEL` caps agent fan-out.** If your agent dispatches many concurrent
-  tool calls or sub-agents, raise `PARALLEL` in `.env` accordingly (each slot
-  consumes additional KV-cache memory).
-- **Local models trail frontier APIs** on long-horizon planning and complex
-  tool use — temper expectations for elaborate agent loops.
+- `PARALLEL` caps concurrent requests; each slot consumes additional KV-cache
+  memory.
+
+## NVIDIA Jetson (Orin / JetPack 6)
+
+The stack also runs on Jetson Orin devices (tested on an Orin Nano Super
+Developer Kit, L4T r36.4.7 / CUDA 12.6). The upstream `server-cuda` image does
+not work there: its arm64 variant is built with CUDA 12.8 for server-class
+GPUs and ships no `sm_87` cubin, so model load aborts with *"the provided PTX
+was compiled with an unsupported toolchain"*. `jetson/Dockerfile` instead
+builds the same pinned llama.cpp release on the device, against the L4T CUDA
+toolchain and with a native `sm_87` kernel image.
+
+```bash
+# On the Jetson (requires JetPack 6 and Docker with the nvidia runtime):
+./scripts/setup.sh myjetson.lan
+echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml' >> .env
+
+docker compose build     # one-time on-device build of llama-server
+docker compose up -d
+curl --cacert certs/ca.crt https://localhost:8443/v1/models
+```
+
+Sizing for an 8 GB Orin Nano, where CPU and GPU share ~7.4 GiB of unified
+memory and the OS takes about 1 GiB:
+
+- 4B-class Q4_K_M models fit with all layers offloaded; 7-8B Q4 fits only
+  with a small `CTX_SIZE` and `q8_0` KV cache.
+- Keep `PARALLEL` at 1-2; each slot multiplies KV-cache memory.
+- 30B-class models do not fit; do not reuse an `.env` sized for a
+  discrete-GPU host.
 
 ## TLS Certificates
 
@@ -152,8 +173,8 @@ The setup script generates a self-signed CA and server certificate in `./certs/`
 
 | File          | Purpose                                        |
 |--------------|------------------------------------------------|
-| `ca.crt`     | CA certificate — distribute to clients         |
-| `ca.key`     | CA private key — keep secret                   |
+| `ca.crt`     | CA certificate - distribute to clients         |
+| `ca.key`     | CA private key - keep secret                   |
 | `server.crt` | Server certificate (used by nginx)             |
 | `server.key` | Server private key (used by nginx)             |
 
@@ -169,8 +190,11 @@ rm -rf certs/
 ```
 .
 ├── docker-compose.yml          # Service definitions
+├── docker-compose.jetson.yml   # Jetson override (locally built image)
 ├── .env                        # Runtime configuration (git-ignored)
 ├── .env.example                # Template for .env
+├── jetson/
+│   └── Dockerfile              # llama.cpp build for Jetson Orin (sm_87)
 ├── nginx/
 │   └── nginx.conf              # TLS reverse proxy config
 ├── scripts/
@@ -191,7 +215,7 @@ rm -rf certs/
 **Container won't start / GPU not found:**
 - Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - Run `nvidia-smi` to confirm GPU visibility
-- Run `docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi` to test Docker GPU access
+- Run `docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi` to test Docker GPU access
 
 **Model loading is slow:**
 - Increase `GPU_LAYERS` (default `-1` = all) to offload more to GPU

@@ -1,0 +1,10 @@
+# Jetson Orin (JetPack 6) override: replaces the upstream image, which does
+# not run on the Tegra iGPU (see jetson/Dockerfile), with a locally built one.
+# Activate with COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml in
+# .env, or pass both files with -f.
+services:
+  llama-server:
+    image: local/llama.cpp:server-cuda-jetson
+    pull_policy: build
+    build:
+      context: ./jetson

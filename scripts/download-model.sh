@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# download-model.sh — Download a GGUF model from Hugging Face.
+# download-model.sh - Download a GGUF model from Hugging Face.
 #
 # Supports both single-file and split/sharded GGUF models.
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup.sh — One-shot bootstrap: generate certs, create dirs, validate config.
+# setup.sh - One-shot bootstrap: generate certs, create dirs, validate config.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,7 +8,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 echo "╔══════════════════════════════════════════════════╗"
-echo "║       llama.cpp Local Server — Setup             ║"
+echo "║       llama.cpp Local Server - Setup             ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
@@ -44,7 +44,7 @@ VENV_DIR="$PROJECT_DIR/.venv"
 if [[ ! -x "$VENV_DIR/bin/hf" && ! -x "$VENV_DIR/bin/huggingface-cli" ]]; then
   echo "==> Setting up Python venv for the Hugging Face CLI …"
   if ! command -v python3 &>/dev/null; then
-    echo "⚠  python3 not found — skipping venv setup."
+    echo "⚠  python3 not found - skipping venv setup."
     echo "   Install Python 3 and re-run setup.sh to enable model downloads."
   else
     python3 -m venv "$VENV_DIR"
