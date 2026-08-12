@@ -32,13 +32,13 @@ git clone <this-repo> && cd local-llm-setup
 #    Pass extra hostnames/IPs for the TLS certificate SANs:
 ./scripts/setup.sh myserver.lan 10.0.0.5
 
-# 3. Download a model (or place a .gguf file in ./models/ manually)
+# 3. Download the reference model (or place another .gguf in ./models/)
 ./scripts/download-model.sh \
-  TheBloke/Mistral-7B-Instruct-v0.2-GGUF \
-  mistral-7b-instruct-v0.2.Q4_K_M.gguf
+  unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF \
+  Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf
 
 # 4. Point .env to your model
-sed -i 's|MODEL_FILE=.*|MODEL_FILE=/models/mistral-7b-instruct-v0.2.Q4_K_M.gguf|' .env
+sed -i 's|MODEL_FILE=.*|MODEL_FILE=/models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf|' .env
 
 # 5. Start the stack
 docker compose up -d
@@ -47,25 +47,45 @@ docker compose up -d
 curl --cacert certs/ca.crt https://localhost:8443/v1/models
 ```
 
+## Reference model
+
+The documented deployment target is
+[Devstral Small 2 24B Instruct (2512)](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512),
+Mistral AI's open-weight (Apache 2.0) agentic coding model, quantised to
+Q4_K_M (14.3 GB, [unsloth GGUF](https://huggingface.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF)).
+
+Sizing on a 32 GB GPU: the model's native context is 262144 tokens, but its KV
+cache costs ~80 KB/token at `q8_0` (40 layers, 8 KV heads, head dim 128), so
+the full window does not fit next to the weights. `CTX_SIZE=131072` with
+`CACHE_TYPE_K/V=q8_0` uses ~10.5 GB of KV cache for a total of ~27 GB and is
+the largest power-of-two window that fits. Mistral recommends sampling at
+temperature 0.15 (a client-side setting).
+
+Any other GGUF model works; see the note under
+[agent frameworks](#using-as-the-backend-for-an-agent-framework) before
+swapping the model on a tuned agent deployment.
+
 ## Configuration
 
 All settings live in `.env` (created from `.env.example` by the setup script):
 
 | Variable       | Default              | Description                               |
 |----------------|----------------------|-------------------------------------------|
-| `MODEL_FILE`   | `/models/model.gguf` | Path to model inside the container        |
-| `CTX_SIZE`     | `4096`               | Context window size (tokens)              |
+| `MODEL_FILE`   | Devstral Small 2 Q4_K_M | Path to model inside the container     |
+| `CTX_SIZE`     | `131072`             | Context window size (tokens)              |
 | `GPU_LAYERS`   | `-1`                 | Layers offloaded to GPU (`-1` = all)      |
-| `PARALLEL`     | `4`                  | Concurrent request slots                  |
+| `PARALLEL`     | `1`                  | Concurrent request slots                  |
 | `HTTPS_PORT`   | `8443`               | Port exposed for HTTPS                    |
-| `CACHE_TYPE_K` | `f16`                | KV-cache key quantisation (e.g. `q8_0`)   |
-| `CACHE_TYPE_V` | `f16`                | KV-cache value quantisation (e.g. `q8_0`) |
+| `CACHE_TYPE_K` | `q8_0`               | KV-cache key quantisation (`f16`, `q8_0`) |
+| `CACHE_TYPE_V` | `q8_0`               | KV-cache value quantisation               |
 | `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
 | `MODELS_DIR`   | `./models`           | Host directory bind-mounted at `/models`  |
 | `COMPOSE_FILE` | (unset)              | Extra compose files, e.g. the Jetson override |
 
-Setting both cache types to `q8_0` halves KV-cache memory; this is what lets
-`CTX_SIZE=65536` fit alongside Q4_K_M weights on a 32 GB GPU.
+Setting both cache types to `q8_0` halves KV-cache memory versus `f16`; this
+is what lets `CTX_SIZE=131072` fit alongside the reference model's Q4_K_M
+weights on a 32 GB GPU. With `PARALLEL>1` llama.cpp divides `CTX_SIZE` across
+slots, shrinking the real per-request window.
 
 ## OpenAI-Compatible API
 
@@ -133,8 +153,8 @@ above.
   `docker-compose.yml`).
 - Do not change `MODEL_FILE` on a working agent deployment without re-running
   its benchmark: prompts tuned against one model can regress badly on another
-  even when the new model's tool calling is mechanically better.
-  [MODEL-TRIAL.md](MODEL-TRIAL.md) records a measured case.
+  even when the new model's tool calling is mechanically better. A measured
+  case is recorded in git history (`git show de9bed3:MODEL-TRIAL.md`).
 - `PARALLEL` caps concurrent requests; each slot consumes additional KV-cache
   memory.
 
@@ -164,8 +184,8 @@ memory and the OS takes about 1 GiB:
 - 4B-class Q4_K_M models fit with all layers offloaded; 7-8B Q4 fits only
   with a small `CTX_SIZE` and `q8_0` KV cache.
 - Keep `PARALLEL` at 1-2; each slot multiplies KV-cache memory.
-- 30B-class models do not fit; do not reuse an `.env` sized for a
-  discrete-GPU host.
+- Models of 24B class and above, including the reference Devstral Small 2, do
+  not fit; do not reuse an `.env` sized for a discrete-GPU host.
 
 ## TLS Certificates
 
@@ -183,51 +203,4 @@ To regenerate certs (e.g., with new SANs):
 ```bash
 rm -rf certs/
 ./scripts/gen-certs.sh myserver.lan 10.0.0.5 192.168.1.100
-```
-
-## File Structure
-
-```
-.
-├── docker-compose.yml          # Service definitions
-├── docker-compose.jetson.yml   # Jetson override (locally built image)
-├── .env                        # Runtime configuration (git-ignored)
-├── .env.example                # Template for .env
-├── jetson/
-│   └── Dockerfile              # llama.cpp build for Jetson Orin (sm_87)
-├── nginx/
-│   └── nginx.conf              # TLS reverse proxy config
-├── scripts/
-│   ├── setup.sh                # Bootstrap script
-│   ├── gen-certs.sh            # TLS certificate generator
-│   └── download-model.sh       # Model downloader (Hugging Face)
-├── models/                     # GGUF model files (git-ignored)
-│   └── *.gguf
-└── certs/                      # TLS certificates (git-ignored)
-    ├── ca.crt
-    ├── ca.key
-    ├── server.crt
-    └── server.key
-```
-
-## Troubleshooting
-
-**Container won't start / GPU not found:**
-- Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-- Run `nvidia-smi` to confirm GPU visibility
-- Run `docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi` to test Docker GPU access
-
-**Model loading is slow:**
-- Increase `GPU_LAYERS` (default `-1` = all) to offload more to GPU
-- Check VRAM usage with `nvidia-smi`
-
-**TLS errors from clients:**
-- Ensure the client trusts `certs/ca.crt`
-- Check that the server hostname/IP is in the certificate SANs:
-  `openssl x509 -in certs/server.crt -noout -ext subjectAltName`
-
-**Logs:**
-```bash
-docker compose logs -f llama-server   # llama.cpp logs
-docker compose logs -f nginx          # proxy logs
 ```

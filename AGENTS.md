@@ -19,8 +19,9 @@ matches once the MCP toggle is back in its original state.
 The served model and `local-claw`'s tuned `opensearch` skill are **co-adapted**: the skill
 is prompt text written to correct one specific model's priors, so a drop-in model swap
 regresses hard even when the new model's tool calling is mechanically better. Measured in
-[MODEL-TRIAL.md](MODEL-TRIAL.md): a same-size, same-family, same-quant candidate scored
-40.5 % against the incumbent's 83.3 - 97.6 % band. Validate any model change against
+the trial report kept in git history (`git show de9bed3:MODEL-TRIAL.md`): a same-size,
+same-family, same-quant candidate scored 40.5 % against the incumbent's 83.3 - 97.6 %
+band. Validate any model change against
 `local-llm-claw-benchmark` bank v1 before shipping it, and budget for re-tuning the skill.
 
 ## Maintaining this file
