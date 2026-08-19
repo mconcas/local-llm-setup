@@ -12,8 +12,8 @@
 #
 # Examples:
 #   # Single file download
-#   ./scripts/download-model.sh unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF \
-#       Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf
+#   ./scripts/download-model.sh bartowski/Qwen3.8-27B-GGUF \
+#       Qwen3.8-27B-Q6_K.gguf
 #
 #   # Split/sharded model (downloads entire subdirectory)
 #   ./scripts/download-model.sh unsloth/Qwen3.5-397B-A17B-GGUF \
@@ -29,7 +29,7 @@ if [[ $# -lt 2 ]]; then
   echo ""
   echo "Examples:"
   echo "  # Single file"
-  echo "  $0 unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"
+  echo "  $0 bartowski/Qwen3.8-27B-GGUF Qwen3.8-27B-Q6_K.gguf"
   echo ""
   echo "  # Split/sharded model (subdirectory)"
   echo "  $0 unsloth/Qwen3.5-397B-A17B-GGUF --include 'Q4_K_M/*'"

@@ -2,16 +2,17 @@
 
 A reproducible, Docker Compose-based setup for running a local LLM server via
 [llama.cpp](https://github.com/ggerganov/llama.cpp) with **NVIDIA GPU
-acceleration**, **TLS encryption**, and an **OpenAI-compatible API**.
+acceleration**, **mutual TLS** (clients authenticate with certificates), and an
+**OpenAI-compatible API**.
 
 ## Architecture
 
 ```
-Clients (MCP server, curl, etc.)
+Clients (curl, SDKs, agent frameworks)
         │
-        ▼  HTTPS :8443
+        ▼  HTTPS :8443 (mTLS: client cert required)
 ┌───────────────────┐
-│   nginx (TLS)     │  ← terminates TLS, forwards to llama.cpp
+│   nginx (mTLS)    │  ← terminates TLS, verifies client certs, forwards to llama.cpp
 └───────┬───────────┘
         │  HTTP :8080 (internal)
 ┌───────▼───────────┐
@@ -28,38 +29,46 @@ Clients (MCP server, curl, etc.)
 # 1. Clone and enter the repo
 git clone <this-repo> && cd local-llm-setup
 
-# 2. Run the setup script (generates TLS certs, checks prerequisites)
-#    Pass extra hostnames/IPs for the TLS certificate SANs:
+# 2. Run the setup script (generates CA, server and client certs, checks
+#    prerequisites). Pass extra hostnames/IPs for the TLS certificate SANs:
 ./scripts/setup.sh myserver.lan 10.0.0.5
 
 # 3. Download the reference model (or place another .gguf in ./models/)
 ./scripts/download-model.sh \
-  unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF \
-  Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf
+  bartowski/Qwen3.8-27B-GGUF \
+  Qwen3.8-27B-Q6_K.gguf
 
-# 4. Point .env to your model
-sed -i 's|MODEL_FILE=.*|MODEL_FILE=/models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf|' .env
+# 4. The default .env already points at the reference model; for any other
+#    model set MODEL_FILE and a matching CHAT_TEMPLATE_FILE in .env
 
 # 5. Start the stack
 docker compose up -d
 
-# 6. Verify
-curl --cacert certs/ca.crt https://localhost:8443/v1/models
+# 6. Verify (mTLS: the client cert is mandatory)
+curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
+  https://localhost:8443/v1/models
 ```
 
 ## Reference model
 
 The documented deployment target is
-[Devstral Small 2 24B Instruct (2512)](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512),
-Mistral AI's open-weight (Apache 2.0) agentic coding model, quantised to
-Q4_K_M (14.3 GB, [unsloth GGUF](https://huggingface.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF)).
+[Qwen3.8 27B](https://huggingface.co/bartowski/Qwen3.8-27B-GGUF), a dense 27B
+reasoning model, quantised to Q6_K (22 GiB, bartowski GGUF). The GGUF is
+served text-only in this stack (no vision projector is wired in).
 
-Sizing on a 32 GB GPU: the model's native context is 262144 tokens, but its KV
-cache costs ~80 KB/token at `q8_0` (40 layers, 8 KV heads, head dim 128), so
-the full window does not fit next to the weights. `CTX_SIZE=131072` with
-`CACHE_TYPE_K/V=q8_0` uses ~10.5 GB of KV cache for a total of ~27 GB and is
-the largest power-of-two window that fits. Mistral recommends sampling at
-temperature 0.15 (a client-side setting).
+Sizing on a 32 GB GPU (measured on an RTX 5090): the model's native context
+is 262144 tokens, but the full window does not fit next to the Q6_K weights.
+`CTX_SIZE=131072` with `CACHE_TYPE_K/V=q8_0` totals ~27.2 GiB of VRAM and is
+the largest power-of-two window that fits; decode runs at ~60 tok/s. The
+model emits thinking output, so give clients a generous `max_tokens`.
+Sampling defaults ship in the GGUF (temperature 1.0, top_k 20, top_p 0.95).
+
+Requires a llama.cpp build of b10499 or newer: older `server-cuda` images
+(e.g. May 2026) produce garbage output for this model via a DeltaNet CUDA
+bug. The chat template must be the matching relaxed Qwen3.8 file (see
+`CHAT_TEMPLATE_FILE` in `.env.example`);
+`templates/devstral-small-2-relaxed.jinja` remains available for the previous
+Devstral Small 2 reference model.
 
 Any other GGUF model works; see the note under
 [agent frameworks](#using-as-the-backend-for-an-agent-framework) before
@@ -71,7 +80,7 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 
 | Variable       | Default              | Description                               |
 |----------------|----------------------|-------------------------------------------|
-| `MODEL_FILE`   | Devstral Small 2 Q4_K_M | Path to model inside the container     |
+| `MODEL_FILE`   | Qwen3.8 27B Q6_K     | Path to model inside the container        |
 | `CTX_SIZE`     | `131072`             | Context window size (tokens)              |
 | `GPU_LAYERS`   | `-1`                 | Layers offloaded to GPU (`-1` = all)      |
 | `PARALLEL`     | `1`                  | Concurrent request slots                  |
@@ -83,7 +92,7 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `COMPOSE_FILE` | (unset)              | Extra compose files, e.g. the Jetson override |
 
 Setting both cache types to `q8_0` halves KV-cache memory versus `f16`; this
-is what lets `CTX_SIZE=131072` fit alongside the reference model's Q4_K_M
+is what lets `CTX_SIZE=131072` fit alongside the reference model's Q6_K
 weights on a 32 GB GPU. With `PARALLEL>1` llama.cpp divides `CTX_SIZE` across
 slots, shrinking the real per-request window.
 
@@ -101,7 +110,8 @@ llama.cpp exposes these OpenAI-compatible endpoints:
 ### Example: Chat Completion
 
 ```bash
-curl --cacert certs/ca.crt https://localhost:8443/v1/chat/completions \
+curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
+  https://localhost:8443/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "any",
@@ -115,37 +125,44 @@ curl --cacert certs/ca.crt https://localhost:8443/v1/chat/completions \
 
 ### Connecting from another machine on the network
 
-```bash
-# On the client, use the server's IP/hostname and trust the CA cert:
-curl --cacert ca.crt https://10.0.0.5:8443/v1/models
+Issue a dedicated certificate per client machine and copy it over together
+with the CA certificate:
 
-# Or add the CA system-wide (Debian/Ubuntu):
+```bash
+# On the server:
+./scripts/gen-certs.sh --client laptop
+scp certs/ca.crt certs/laptop.crt certs/laptop.key user@laptop:
+
+# On the client:
+curl --cacert ca.crt --cert laptop.crt --key laptop.key \
+  https://10.0.0.5:8443/v1/models
+
+# Optionally trust the CA system-wide (Debian/Ubuntu) to drop --cacert:
 sudo cp ca.crt /usr/local/share/ca-certificates/llama-local-ca.crt
 sudo update-ca-certificates
-
-# Then no --cacert needed:
-curl https://myserver.lan:8443/v1/models
 ```
 
-### Using with an MCP server / OpenAI-compatible client
+### Using with an OpenAI-compatible client
 
 Point the client at:
 
 ```
 Base URL:  https://<server-ip>:8443/v1
-API Key:   (leave empty or use any string - no API key auth is enforced)
+API Key:   (any string - authentication is the client certificate, not a key)
 ```
 
-If the client doesn't support custom CA certs, either:
-- Install `certs/ca.crt` system-wide on the client machine, or
-- Set `NODE_EXTRA_CA_CERTS=path/to/ca.crt` (Node.js clients), or
-- Set `REQUESTS_CA_BUNDLE=path/to/ca.crt` (Python `requests`)
+The client must support both a custom CA and a client certificate:
+- Python `requests`: `verify="ca.crt"`, `cert=("client.crt", "client.key")`
+- Python OpenAI SDK: pass an `httpx.Client(verify="ca.crt", cert=(...))`
+- Node.js: `https.Agent({ca, cert, key})` on the HTTP client; the
+  `NODE_EXTRA_CA_CERTS` env var covers only the CA half
+- Clients that cannot present a client certificate cannot connect
 
 ### Using as the backend for an agent framework
 
-Any client that accepts a custom `base_url` and a dummy API key (OpenAI SDK,
-LangChain, MCP servers, custom tool-calling loops) can use the HTTPS endpoint
-above.
+Any client that accepts a custom `base_url`, a dummy API key, and TLS client
+credentials (OpenAI SDK, LangChain, custom tool-calling loops) can use the
+HTTPS endpoint above.
 
 - Use a model trained for tool/function calling, and verify with a
   tool-calling probe before relying on it; correct parsing also depends on the
@@ -175,7 +192,8 @@ echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml' >> .env
 
 docker compose build     # one-time on-device build of llama-server
 docker compose up -d
-curl --cacert certs/ca.crt https://localhost:8443/v1/models
+curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
+  https://localhost:8443/v1/models
 ```
 
 Sizing for an 8 GB Orin Nano, where CPU and GPU share ~7.4 GiB of unified
@@ -184,23 +202,47 @@ memory and the OS takes about 1 GiB:
 - 4B-class Q4_K_M models fit with all layers offloaded; 7-8B Q4 fits only
   with a small `CTX_SIZE` and `q8_0` KV cache.
 - Keep `PARALLEL` at 1-2; each slot multiplies KV-cache memory.
-- Models of 24B class and above, including the reference Devstral Small 2, do
-  not fit; do not reuse an `.env` sized for a discrete-GPU host.
+- Models of 24B class and above, including the reference Qwen3.8 27B, do not
+  fit; do not reuse an `.env` sized for a discrete-GPU host.
 
-## TLS Certificates
+## TLS Certificates (mutual TLS)
 
-The setup script generates a self-signed CA and server certificate in `./certs/`:
+nginx requires every client to present a certificate signed by the local CA
+(`ssl_verify_client on`); connections without one are rejected with HTTP 400
+before reaching llama.cpp. The setup script generates all of this in `./certs/`:
 
-| File          | Purpose                                        |
-|--------------|------------------------------------------------|
-| `ca.crt`     | CA certificate - distribute to clients         |
-| `ca.key`     | CA private key - keep secret                   |
-| `server.crt` | Server certificate (used by nginx)             |
-| `server.key` | Server private key (used by nginx)             |
+| File          | Purpose                                             |
+|--------------|-----------------------------------------------------|
+| `ca.crt`     | CA certificate - distribute to clients              |
+| `ca.key`     | CA private key - keep secret, signs all certs       |
+| `server.crt` | Server certificate (used by nginx)                  |
+| `server.key` | Server private key (used by nginx)                  |
+| `client.crt` | Default client certificate                          |
+| `client.key` | Default client private key                          |
 
-To regenerate certs (e.g., with new SANs):
+Issue one certificate per client so they can be distributed and replaced
+independently:
 
 ```bash
-rm -rf certs/
-./scripts/gen-certs.sh myserver.lan 10.0.0.5 192.168.1.100
+./scripts/gen-certs.sh --client laptop   # writes certs/laptop.{crt,key}
 ```
+
+To regenerate the server certificate (e.g., with new SANs), delete only the
+server pair - the CA is reused, so existing client certs stay valid:
+
+```bash
+rm certs/server.crt certs/server.key
+./scripts/gen-certs.sh myserver.lan 10.0.0.5 192.168.1.100
+docker compose up -d --force-recreate nginx
+```
+
+Deleting the whole `certs/` directory discards the CA and invalidates every
+distributed client certificate and CA trust store - only do that to evict a
+client, since there is no certificate revocation list: re-key the CA, reissue
+the remaining client certs, and redistribute.
+
+Certificates expire: the CA after 10 years, server and client certs after
+~825 days. Reissue and redistribute before expiry; the failure mode is sudden
+TLS errors on all clients. Config changes to `nginx/nginx.conf` or `certs/`
+need `docker compose up -d --force-recreate nginx` (a plain reload keeps the
+old bind-mounted file).
