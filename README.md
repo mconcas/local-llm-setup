@@ -85,11 +85,13 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `GPU_LAYERS`   | `-1`                 | Layers offloaded to GPU (`-1` = all)      |
 | `PARALLEL`     | `1`                  | Concurrent request slots                  |
 | `HTTPS_PORT`   | `8443`               | Port exposed for HTTPS                    |
+| `CHAT_TEMPLATE_KWARGS` | `{}`         | Extra chat-template variables, e.g. `{"enable_thinking":false}` |
 | `CACHE_TYPE_K` | `q8_0`               | KV-cache key quantisation (`f16`, `q8_0`) |
 | `CACHE_TYPE_V` | `q8_0`               | KV-cache value quantisation               |
 | `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
 | `MODELS_DIR`   | `./models`           | Host directory bind-mounted at `/models`  |
 | `COMPOSE_FILE` | (unset)              | Extra compose files: Jetson override, observability add-on |
+| `LOCAL_MODEL_NAMES` / `PASSTHROUGH_UPSTREAM` | (unset) | Route inference requests by model name, see [small-model endpoint](#small-model-endpoint-for-claude-code) |
 | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / (required) | Grafana login (observability add-on) |
 | `GRAFANA_ROOT_URL` | `https://localhost:8443/grafana/` | Public Grafana URL through nginx |
 | `METRICS_RETENTION` / `LOGS_RETENTION` | `30d` / `720h` | Prometheus / Loki retention |
@@ -178,6 +180,117 @@ HTTPS endpoint above.
 - `PARALLEL` caps concurrent requests; each slot consumes additional KV-cache
   memory.
 
+## Small-model endpoint for Claude Code
+
+Claude Code talks to one `ANTHROPIC_BASE_URL` for every model it uses, with
+no per-model endpoint. To serve only its Haiku-class model (background jobs
+such as conversation summaries, plus anything run with `--model haiku`) from
+this stack while the main model stays on Anthropic, nginx routes each
+inference request by the `model` field of its body (`nginx/router.js`):
+
+- `model` listed in `LOCAL_MODEL_NAMES` (comma-separated) -> local llama.cpp
+- any other model -> `PASSTHROUGH_UPSTREAM`, forwarded verbatim: headers
+  (`Authorization`, `anthropic-beta`, ...), body, SSE stream and error bodies
+  pass through unchanged, so the claude.ai login or API key configured in
+  Claude Code keeps working and is never stored on the server
+
+Routed paths are `/v1/messages`, `/v1/messages/count_tokens`,
+`/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`; everything
+else (`/v1/models`, `/health`, `/grafana/`) stays local. With
+`PASSTHROUGH_UPSTREAM` empty every model name is served locally, which is the
+default and the previous behaviour.
+
+### Server side (Jetson Orin Nano 8 GB reference profile)
+
+The small model is [Qwen3.5 4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)
+at UD-Q4_K_XL (2.7 GiB): it is trained for tool calling, its hybrid
+Gated-DeltaNet/attention layout keeps the KV cache small at the long
+contexts summarisation prompts carry, and it shares the llama.cpp build pin
+and template lineage of the reference Qwen3.8 model.
+`templates/qwen3.5-4b-relaxed.jinja` is its embedded template with the same
+relaxations as the Qwen3.8 one. Measured on the Orin Nano with the full
+stack idle, CUDA can allocate about 5.2 GiB; this quant at `CTX_SIZE=65536`
+uses 2.9 GiB weights + 1.1 GiB KV + 0.2 GiB recurrent state + 0.4 GiB
+compute and leaves ~1 GiB. Q6_K (3.8 GiB loaded) does not fit at any context
+size worth having. Thinking is disabled through the template
+(`CHAT_TEMPLATE_KWARGS={"enable_thinking":false}`; `--reasoning-budget 0`
+has no effect on this model): background jobs are latency-bound and the
+model otherwise spends its whole output budget reasoning.
+
+```bash
+# On the Jetson, after the Jetson section above:
+./scripts/download-model.sh unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-UD-Q4_K_XL.gguf
+```
+
+```bash
+# .env
+MODEL_FILE=/models/Qwen3.5-4B-UD-Q4_K_XL.gguf
+CHAT_TEMPLATE_FILE=/templates/qwen3.5-4b-relaxed.jinja
+CTX_SIZE=65536
+CHAT_TEMPLATE_KWARGS={"enable_thinking":false}
+LOCAL_MODEL_NAMES=qwen3.5-4b
+PASSTHROUGH_UPSTREAM=https://api.anthropic.com
+```
+
+`docker compose up -d` (nginx needs `--force-recreate` when only the routing
+variables changed). The server certificate must carry the hostname clients
+will use (`./scripts/setup.sh myjetson.lan` or regenerate it, see
+[TLS certificates](#tls-certificates-mutual-tls)). The same profile works on
+any host running this stack; only the model sizing is Jetson-specific.
+
+### Client side
+
+On the server, issue a certificate for the client machine and print its
+configuration:
+
+```bash
+./scripts/claude-code-client.sh laptop myjetson.lan
+```
+
+It copies `ca.crt`, `laptop.crt` and `laptop.key` to the client's
+`~/.config/local-llm/` and prints the `env` block for the client's
+`~/.claude/settings.json`:
+
+```json
+"env": {
+  "ANTHROPIC_BASE_URL": "https://myjetson.lan:8443",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.5-4b",
+  "ENABLE_TOOL_SEARCH": "true",
+  "CLAUDE_CODE_CLIENT_CERT": "/home/me/.config/local-llm/laptop.crt",
+  "CLAUDE_CODE_CLIENT_KEY": "/home/me/.config/local-llm/laptop.key",
+  "NODE_EXTRA_CA_CERTS": "/home/me/.config/local-llm/ca.crt"
+}
+```
+
+Do not set `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` unless you want
+pass-through traffic billed to that key: with only `ANTHROPIC_BASE_URL` set,
+the saved claude.ai login remains the credential. Verify with
+`claude --model haiku -p 'reply with pong'` (served locally; the nginx access
+log shows `upstream_status` from llama.cpp) and a normal session (pass-through).
+`claude --debug` prints `mTLS: Loaded client certificate` on startup.
+
+`ENABLE_TOOL_SEARCH=true` is not optional: a non-first-party
+`ANTHROPIC_BASE_URL` turns MCP tool search off, so Claude Code sends every
+MCP tool schema upfront, and llama.cpp b10499 turns some of them (e.g. a
+`format: date` string) into a grammar it then fails to parse, answering
+`400 Failed to initialize samplers`. With tool search on, MCP tools arrive as
+`tool_reference` blocks, which this proxy forwards untouched. Other
+consequences of a non-first-party base URL (Claude Code docs): Remote
+Control is disabled, fast-mode and WebFetch safety checks still call
+`api.anthropic.com` directly, `--model haiku` warns that the model ID is
+unrecognised and assumes a 200k window, and all Claude Code traffic now
+depends on this server being up. The access log records `model` and `route`
+(`local`/`passthrough`) per request.
+
+Measured on the Orin Nano in its default 15 W mode (`nvpmodel` mode 0, GPU
+capped at 612 MHz): 280 prompt tok/s and 7 tok/s decode; a `--model haiku`
+turn carrying Claude Code's built-in tool set (~16k tokens) takes ~55 s
+before the first token, and background jobs are shorter. Switch to
+`MAXN_SUPER` (`sudo nvpmodel -m 2 && sudo jetson_clocks`) and boot headless
+(`sudo systemctl set-default multi-user.target`, the desktop holds ~0.5 GiB)
+before judging latency; both need root and were not applied on the test
+device.
+
 ## Observability (metrics, logs, dashboards)
 
 `docker-compose.observability.yml` adds a Prometheus + Loki + Grafana stack that
@@ -241,11 +354,18 @@ curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
 Sizing for an 8 GB Orin Nano, where CPU and GPU share ~7.4 GiB of unified
 memory and the OS takes about 1 GiB:
 
-- 4B-class Q4_K_M models fit with all layers offloaded; 7-8B Q4 fits only
-  with a small `CTX_SIZE` and `q8_0` KV cache.
+- 4B-class Q4 models fit with all layers offloaded and a 64k context; 7-8B
+  Q4 fits only with a small `CTX_SIZE` and `q8_0` KV cache.
+- The override sets `LLAMA_ARG_LOAD_MODE=dio`: an mmap-loaded GGUF keeps a
+  second copy of the weights in page cache that the Tegra allocator never
+  reclaims, so the KV-cache allocation fails with `cudaMalloc out of memory`
+  while `free` still reports gigabytes available.
 - Keep `PARALLEL` at 1-2; each slot multiplies KV-cache memory.
 - Models of 24B class and above, including the reference Qwen3.8 27B, do not
   fit; do not reuse an `.env` sized for a discrete-GPU host.
+
+The sized, tested profile for this board is the
+[Claude Code small-model endpoint](#small-model-endpoint-for-claude-code).
 
 ## TLS Certificates (mutual TLS)
 

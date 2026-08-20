@@ -28,7 +28,8 @@ old inode. Verify enforcement with one certless curl (expect 400) and one with
 
 `llama-server` runs with `LLAMA_ARG_CHAT_TEMPLATE_FILE` (default in `docker-compose.yml`,
 overridable via `CHAT_TEMPLATE_FILE` in `.env`) instead of the GGUF-embedded template.
-`templates/qwen3.8-27b-relaxed.jinja` (the default, for the reference Qwen3.8 27B) and
+`templates/qwen3.8-27b-relaxed.jinja` (the default, for the reference Qwen3.8 27B),
+`templates/qwen3.5-4b-relaxed.jinja` (Jetson small-model profile) and
 `templates/devstral-small-2-relaxed.jinja` are the respective embedded templates relaxed
 to hoist `system` messages from any position and to drop the strict role-alternation
 check; without this, Anthropic-API clients such as Claude Code get Jinja 500s. When
@@ -36,6 +37,18 @@ swapping the model, swap this file for one matching the new model. An empty
 `CHAT_TEMPLATE_FILE` is a startup error, not a fallback to the embedded template.
 Regression-check template edits by diffing `POST /apply-template` output for a canonical
 conversation before and after.
+
+## Model routing in nginx
+
+`nginx/router.js` (njs) routes the inference paths by the body's `model` field:
+`LOCAL_MODEL_NAMES` go to llama.cpp, anything else to `PASSTHROUGH_UPSTREAM`
+(empty = everything local). Both reach nginx as container env, so changing them
+needs `docker compose up -d --force-recreate nginx`. The routing location pins
+`client_body_buffer_size` to the body limit because njs only sees in-memory
+bodies. Pass-through must stay byte-transparent (headers, SSE, error bodies):
+Claude Code's retry logic matches upstream error wording. Test both legs after
+touching it: a request with a local model name and one with a foreign name,
+checking `upstream_status` in the JSON access log.
 
 ## Observability add-on
 

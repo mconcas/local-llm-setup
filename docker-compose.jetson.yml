@@ -8,3 +8,8 @@ services:
     pull_policy: build
     build:
       context: ./jetson
+    environment:
+      # Unified memory: an mmap-loaded GGUF keeps a second copy of the weights
+      # in page cache that the Tegra allocator cannot reclaim, so the KV cache
+      # allocation fails. Direct I/O streams the file into the CUDA buffers.
+      LLAMA_ARG_LOAD_MODE: dio
