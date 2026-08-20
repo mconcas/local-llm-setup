@@ -6,6 +6,7 @@ certs/
 
 # Environment
 .env
+.env.bak*
 
 # Docker
 docker-compose.override.yml

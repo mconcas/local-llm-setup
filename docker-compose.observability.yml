@@ -1,0 +1,141 @@
+# Observability add-on: Prometheus metrics, Loki logs, Grafana dashboards.
+# Activate with COMPOSE_FILE=docker-compose.yml:docker-compose.observability.yml
+# in .env, or pass both files with -f. Grafana is served by nginx under
+# /grafana/ behind the same mTLS vhost; nothing here publishes a host port.
+services:
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: llm-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${METRICS_RETENTION:-30d}
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - llm-net
+
+  loki:
+    image: grafana/loki:3.7.6
+    container_name: llm-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/config.yml -config.expand-env=true
+    environment:
+      LOGS_RETENTION: ${LOGS_RETENTION:-720h}
+    volumes:
+      - ./observability/loki/config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki
+    networks:
+      - llm-net
+
+  alloy:
+    image: grafana/alloy:v1.18.1
+    container_name: llm-alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/config.alloy
+    environment:
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-local-llm-setup}
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - loki
+    networks:
+      - llm-net
+
+  grafana:
+    image: grafana/grafana:13.2.0
+    container_name: llm-grafana
+    restart: unless-stopped
+    environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-https://localhost:8443/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - llm-net
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.5.3
+    container_name: llm-nginx-exporter
+    restart: unless-stopped
+    command:
+      - --nginx.scrape-uri=http://nginx:8081/stub_status
+    depends_on:
+      - nginx
+    networks:
+      - llm-net
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    container_name: llm-node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(host/)?(sys|proc|dev|run|var/lib/docker/.+)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - llm-net
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    container_name: llm-cadvisor
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=10s
+      - --disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,process,referenced_memory,resctrl,sched,tcp,udp
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    networks:
+      - llm-net
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:4.6.0-4.8.3-distroless
+    container_name: llm-dcgm-exporter
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - llm-net
+
+volumes:
+  prometheus-data:
+  loki-data:
+  alloy-data:
+  grafana-data:

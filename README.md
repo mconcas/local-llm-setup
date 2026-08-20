@@ -89,7 +89,10 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `CACHE_TYPE_V` | `q8_0`               | KV-cache value quantisation               |
 | `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
 | `MODELS_DIR`   | `./models`           | Host directory bind-mounted at `/models`  |
-| `COMPOSE_FILE` | (unset)              | Extra compose files, e.g. the Jetson override |
+| `COMPOSE_FILE` | (unset)              | Extra compose files: Jetson override, observability add-on |
+| `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / (required) | Grafana login (observability add-on) |
+| `GRAFANA_ROOT_URL` | `https://localhost:8443/grafana/` | Public Grafana URL through nginx |
+| `METRICS_RETENTION` / `LOGS_RETENTION` | `30d` / `720h` | Prometheus / Loki retention |
 
 Setting both cache types to `q8_0` halves KV-cache memory versus `f16`; this
 is what lets `CTX_SIZE=131072` fit alongside the reference model's Q6_K
@@ -174,6 +177,45 @@ HTTPS endpoint above.
   case is recorded in git history (`git show de9bed3:MODEL-TRIAL.md`).
 - `PARALLEL` caps concurrent requests; each slot consumes additional KV-cache
   memory.
+
+## Observability (metrics, logs, dashboards)
+
+`docker-compose.observability.yml` adds a Prometheus + Loki + Grafana stack that
+joins the same Docker network. Nothing in it publishes a host port: Grafana is
+served by nginx under `/grafana/` on the existing mTLS vhost, so the same client
+certificates gate it.
+
+```bash
+# .env
+COMPOSE_FILE=docker-compose.yml:docker-compose.observability.yml
+GRAFANA_ADMIN_PASSWORD=<choose one>
+GRAFANA_ROOT_URL=https://<public host>:8443/grafana/
+
+docker compose up -d
+```
+
+Then open `https://<host>:8443/grafana/` with the client certificate loaded in
+the browser (import `client.crt` + `client.key` as a PKCS#12 bundle:
+`openssl pkcs12 -export -in certs/client.crt -inkey certs/client.key -out client.p12`).
+
+| Signal | Source | Collector |
+|--------|--------|-----------|
+| Inference metrics (tokens/s, prompt vs decode time, queue, cache hits) | llama.cpp `/metrics` | Prometheus |
+| Proxy metrics (connections, request rate) | nginx `stub_status` on an internal port | nginx-prometheus-exporter |
+| GPU (utilisation, VRAM, power, temperature, clocks, PCIe) | NVIDIA DCGM | dcgm-exporter |
+| Host CPU / memory / disk / network | node-exporter | Prometheus |
+| Per-container CPU / memory / network | cAdvisor | Prometheus |
+| Logs of every container in this project | Docker log driver | Grafana Alloy -> Loki |
+
+The nginx access log is JSON (status, timings, bytes, client certificate CN,
+user agent), so Loki can derive per-client request rates, latency percentiles
+and error counts without extra exporters. Provisioned dashboards live in
+`observability/grafana/dashboards/` and are read-only in the UI; they are
+produced by `observability/grafana/gen-dashboards.py`, so edit that script and
+rerun it, Grafana reloads the files automatically.
+
+Retention is `METRICS_RETENTION` (Prometheus) and `LOGS_RETENTION` (Loki); data
+lives in the `prometheus-data`, `loki-data` and `grafana-data` volumes.
 
 ## NVIDIA Jetson (Orin / JetPack 6)
 

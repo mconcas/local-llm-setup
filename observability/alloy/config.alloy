@@ -1,0 +1,108 @@
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=" + sys.env("COMPOSE_PROJECT")]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  labels     = {job = "docker"}
+  forward_to = [loki.process.pipeline.receiver]
+}
+
+loki.process "pipeline" {
+  stage.match {
+    selector = "{container=\"llama-proxy\"} |= \"\\\"status\\\":\""
+
+    stage.json {
+      expressions = {
+        ts     = "time",
+        status = "status",
+        method = "method",
+      }
+    }
+
+    stage.timestamp {
+      source = "ts"
+      format = "RFC3339"
+    }
+
+    stage.labels {
+      values = {
+        status = "",
+        method = "",
+      }
+    }
+
+    stage.template {
+      source   = "level"
+      template = "{{ if ge (int .status) 500 }}error{{ else if ge (int .status) 400 }}warn{{ else }}info{{ end }}"
+    }
+
+    stage.structured_metadata {
+      values = {
+        level = "",
+      }
+    }
+  }
+
+  stage.match {
+    selector = "{container=\"llama-proxy\"} != \"\\\"status\\\":\""
+
+    stage.regex {
+      expression = "^\\S+ \\S+ \\[(?P<level>\\w+)\\] "
+    }
+
+    stage.structured_metadata {
+      values = {
+        level = "",
+      }
+    }
+  }
+
+  stage.match {
+    selector = "{container=\"llama-server\"}"
+
+    stage.regex {
+      expression = "^\\S+ (?P<lvl>[IWED]) "
+    }
+
+    stage.template {
+      source   = "level"
+      template = "{{ if eq .lvl \"E\" }}error{{ else if eq .lvl \"W\" }}warn{{ else if eq .lvl \"D\" }}debug{{ else if eq .lvl \"I\" }}info{{ end }}"
+    }
+
+    stage.structured_metadata {
+      values = {
+        level = "",
+      }
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

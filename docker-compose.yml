@@ -25,6 +25,8 @@ services:
       # error, so point CHAT_TEMPLATE_FILE at a real file under /templates.
       LLAMA_ARG_JINJA: "1"
       LLAMA_ARG_CHAT_TEMPLATE_FILE: ${CHAT_TEMPLATE_FILE:-/templates/qwen3.8-27b-relaxed.jinja}
+      # Prometheus endpoint at /metrics (scraped by docker-compose.observability.yml).
+      LLAMA_ARG_ENDPOINT_METRICS: "1"
     # Raw HTTP on localhost only; network access goes through nginx.
     ports:
       - "127.0.0.1:8080:8080"
