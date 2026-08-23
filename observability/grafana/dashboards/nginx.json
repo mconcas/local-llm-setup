@@ -35,6 +35,38 @@
           "text": ".*",
           "value": ".*"
         }
+      },
+      {
+        "name": "route",
+        "label": "Route",
+        "type": "custom",
+        "query": ".*,local,sidecar,passthrough",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        },
+        "options": [
+          {
+            "text": ".*",
+            "value": ".*",
+            "selected": true
+          },
+          {
+            "text": "local",
+            "value": "local",
+            "selected": false
+          },
+          {
+            "text": "sidecar",
+            "value": "sidecar",
+            "selected": false
+          },
+          {
+            "text": "passthrough",
+            "value": "passthrough",
+            "selected": false
+          }
+        ]
       }
     ]
   },
@@ -689,6 +721,640 @@
     },
     {
       "id": 25,
+      "type": "row",
+      "title": "Routing",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Requests by route",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (route) (rate({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" [$__auto])) * 60",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqpm",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Requests by model",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 21,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model) (rate({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" [$__auto])) * 60",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqpm",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Upstream status by route",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 21,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (route, upstream_status) (rate({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" [$__auto])) * 60",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "{{route}} {{upstream_status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqpm",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* 5.."
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* 4.."
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "p95 request time by route",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "quantile_over_time(0.95, {container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | unwrap request_time [$__auto]) by (route)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Full duration at nginx, streaming included"
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "p95 time to upstream headers by route",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 29,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "quantile_over_time(0.95, {container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | upstream_header_time=~\"[0-9.]+\" | unwrap upstream_header_time [$__auto]) by (route)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Connect plus time until the backend sent response headers. Not first-token time: llama.cpp sends headers before prompt processing"
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "llama.cpp timings (p95)",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 29,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "quantile_over_time(0.95, {container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_prompt_ms=~\"[0-9]+\" | unwrap usage_prompt_ms [$__auto]) by (route)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "prompt {{route}}"
+        },
+        {
+          "refId": "B",
+          "expr": "quantile_over_time(0.95, {container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_predicted_ms=~\"[0-9]+\" | unwrap usage_predicted_ms [$__auto]) by (route)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "generation {{route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Backend-reported prompt-processing and generation time per request; only legs served by llama.cpp report it"
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Tokens per minute by route",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | unwrap usage_input [$__auto])) * 60",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "input {{route}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | unwrap usage_output [$__auto])) * 60",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "output {{route}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | usage_cache_read=~\"[0-9]+\" | unwrap usage_cache_read [$__auto])) * 60",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "cache read {{route}}"
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | usage_cache_creation=~\"[0-9]+\" | unwrap usage_cache_creation [$__auto])) * 60",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "cache creation {{route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "As reported by each backend in the response usage block; Anthropic input_tokens exclude cached tokens, OpenAI-format prompt_tokens include them"
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Cache read share (hosted leg)",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | usage_cache_read=~\"[0-9]+\" | unwrap usage_cache_read [$__auto])) / (sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | unwrap usage_input [$__auto])) + sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | usage_cache_read=~\"[0-9]+\" | unwrap usage_cache_read [$__auto])) + sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | usage_cache_creation=~\"[0-9]+\" | unwrap usage_cache_creation [$__auto])))",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "cache read / all input"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "table",
+      "title": "Tokens by client and model (range)",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (client_cn, route, model) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | unwrap usage_input [$__range]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (client_cn, route, model) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | unwrap usage_output [$__range]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (client_cn, route, model) (count_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" [$__range]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #A"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "input tokens"
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #B"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "output tokens"
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #C"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "requests"
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "input tokens",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "id": 35,
+      "type": "row",
+      "title": "Connections",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 36,
       "type": "timeseries",
       "title": "Connections",
       "datasource": {
@@ -697,7 +1363,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 55,
         "w": 12,
         "h": 8
       },
@@ -766,7 +1432,7 @@
       }
     },
     {
-      "id": 26,
+      "id": 37,
       "type": "timeseries",
       "title": "Accepted vs handled",
       "datasource": {
@@ -775,7 +1441,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 20,
+        "y": 55,
         "w": 12,
         "h": 8
       },
@@ -827,7 +1493,7 @@
       "description": "A gap means nginx dropped connections (worker_connections exhausted)"
     },
     {
-      "id": 27,
+      "id": 38,
       "type": "table",
       "title": "Top URIs (range)",
       "datasource": {
@@ -836,7 +1502,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 28,
+        "y": 63,
         "w": 12,
         "h": 9
       },
@@ -900,7 +1566,7 @@
       }
     },
     {
-      "id": 28,
+      "id": 39,
       "type": "table",
       "title": "Top user agents (range)",
       "datasource": {
@@ -909,7 +1575,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 28,
+        "y": 63,
         "w": 12,
         "h": 9
       },
@@ -973,7 +1639,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 40,
       "type": "logs",
       "title": "Access log",
       "datasource": {
@@ -982,7 +1648,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 37,
+        "y": 72,
         "w": 24,
         "h": 10
       },
@@ -1014,7 +1680,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 41,
       "type": "logs",
       "title": "nginx error log",
       "datasource": {
@@ -1023,7 +1689,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 47,
+        "y": 82,
         "w": 24,
         "h": 8
       },

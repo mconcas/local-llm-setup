@@ -39,7 +39,7 @@
   },
   "panels": [
     {
-      "id": 31,
+      "id": 42,
       "type": "row",
       "title": "GPU",
       "collapsed": false,
@@ -52,7 +52,7 @@
       "panels": []
     },
     {
-      "id": 32,
+      "id": 43,
       "type": "stat",
       "title": "GPU utilisation",
       "datasource": {
@@ -110,7 +110,7 @@
       }
     },
     {
-      "id": 33,
+      "id": 44,
       "type": "stat",
       "title": "VRAM used",
       "datasource": {
@@ -158,7 +158,7 @@
       }
     },
     {
-      "id": 34,
+      "id": 45,
       "type": "stat",
       "title": "VRAM free",
       "datasource": {
@@ -223,7 +223,7 @@
       }
     },
     {
-      "id": 35,
+      "id": 46,
       "type": "stat",
       "title": "GPU temperature",
       "datasource": {
@@ -287,7 +287,7 @@
       }
     },
     {
-      "id": 36,
+      "id": 47,
       "type": "stat",
       "title": "Power draw",
       "datasource": {
@@ -335,7 +335,7 @@
       }
     },
     {
-      "id": 37,
+      "id": 48,
       "type": "stat",
       "title": "Energy 24h",
       "datasource": {
@@ -384,7 +384,7 @@
       "description": "Counter is in mJ"
     },
     {
-      "id": 38,
+      "id": 49,
       "type": "timeseries",
       "title": "GPU activity",
       "datasource": {
@@ -473,7 +473,7 @@
       }
     },
     {
-      "id": 39,
+      "id": 50,
       "type": "timeseries",
       "title": "VRAM",
       "datasource": {
@@ -543,7 +543,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 51,
       "type": "timeseries",
       "title": "Power and temperature",
       "datasource": {
@@ -640,7 +640,7 @@
       }
     },
     {
-      "id": 41,
+      "id": 52,
       "type": "timeseries",
       "title": "Clocks",
       "datasource": {
@@ -700,7 +700,7 @@
       }
     },
     {
-      "id": 42,
+      "id": 53,
       "type": "timeseries",
       "title": "PCIe",
       "datasource": {
@@ -786,7 +786,7 @@
       }
     },
     {
-      "id": 43,
+      "id": 54,
       "type": "row",
       "title": "Host",
       "collapsed": false,
@@ -799,7 +799,7 @@
       "panels": []
     },
     {
-      "id": 44,
+      "id": 55,
       "type": "timeseries",
       "title": "CPU",
       "datasource": {
@@ -862,7 +862,7 @@
       "description": "Average over all cores"
     },
     {
-      "id": 45,
+      "id": 56,
       "type": "timeseries",
       "title": "Memory",
       "datasource": {
@@ -942,7 +942,7 @@
       "description": "Model weights read via mmap show up as page cache"
     },
     {
-      "id": 46,
+      "id": 57,
       "type": "timeseries",
       "title": "Load",
       "datasource": {
@@ -1012,7 +1012,7 @@
       "description": "Divide by the core count shown in the CPU panel description"
     },
     {
-      "id": 47,
+      "id": 58,
       "type": "timeseries",
       "title": "Disk I/O",
       "datasource": {
@@ -1072,7 +1072,7 @@
       }
     },
     {
-      "id": 48,
+      "id": 59,
       "type": "timeseries",
       "title": "Network",
       "datasource": {
@@ -1132,7 +1132,7 @@
       }
     },
     {
-      "id": 49,
+      "id": 60,
       "type": "bargauge",
       "title": "Filesystem usage",
       "datasource": {
@@ -1198,7 +1198,7 @@
       }
     },
     {
-      "id": 50,
+      "id": 61,
       "type": "row",
       "title": "Containers",
       "collapsed": false,
@@ -1211,7 +1211,7 @@
       "panels": []
     },
     {
-      "id": 51,
+      "id": 62,
       "type": "timeseries",
       "title": "Container CPU",
       "datasource": {
@@ -1263,7 +1263,7 @@
       "description": "100% = one core"
     },
     {
-      "id": 52,
+      "id": 63,
       "type": "timeseries",
       "title": "Container memory (working set)",
       "datasource": {
@@ -1314,7 +1314,7 @@
       }
     },
     {
-      "id": 53,
+      "id": 64,
       "type": "timeseries",
       "title": "Container network",
       "datasource": {
@@ -1374,7 +1374,7 @@
       }
     },
     {
-      "id": 54,
+      "id": 65,
       "type": "timeseries",
       "title": "Container disk I/O",
       "datasource": {

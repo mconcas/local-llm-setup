@@ -61,11 +61,17 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/router.js:/etc/nginx/njs/router.js:ro
       - ./certs:/etc/nginx/certs:ro
+      # Client credentials for SIDECAR_UPSTREAM (ca.crt, client.crt,
+      # client.key). Defaults to ./certs so the mount is valid when unused.
+      - ${SIDECAR_CERTS_DIR:-./certs}:/etc/nginx/sidecar:ro
     environment:
       # Model-based routing, see nginx/router.js. Empty PASSTHROUGH_UPSTREAM
-      # serves every request locally regardless of the model name.
+      # serves every request locally regardless of the model name; empty
+      # SIDECAR_UPSTREAM disables the sidecar leg.
       LOCAL_MODEL_NAMES: ${LOCAL_MODEL_NAMES:-}
       PASSTHROUGH_UPSTREAM: ${PASSTHROUGH_UPSTREAM:-}
+      SIDECAR_MODEL_NAMES: ${SIDECAR_MODEL_NAMES:-}
+      SIDECAR_UPSTREAM: ${SIDECAR_UPSTREAM:-}
     ports:
       - "${HTTPS_PORT:-8443}:443"
     networks:

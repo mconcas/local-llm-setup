@@ -92,6 +92,7 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `MODELS_DIR`   | `./models`           | Host directory bind-mounted at `/models`  |
 | `COMPOSE_FILE` | (unset)              | Extra compose files: Jetson override, observability add-on |
 | `LOCAL_MODEL_NAMES` / `PASSTHROUGH_UPSTREAM` | (unset) | Route inference requests by model name, see [small-model endpoint](#small-model-endpoint-for-claude-code) |
+| `SIDECAR_MODEL_NAMES` / `SIDECAR_UPSTREAM` / `SIDECAR_CERTS_DIR` | (unset) | Forward selected model names to a second instance of this stack, see [sidecar](#sidecar-small-model-on-another-host) |
 | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / (required) | Grafana login (observability add-on) |
 | `GRAFANA_ROOT_URL` | `https://localhost:8443/grafana/` | Public Grafana URL through nginx |
 | `METRICS_RETENTION` / `LOGS_RETENTION` | `30d` / `720h` | Prometheus / Loki retention |
@@ -188,6 +189,8 @@ such as conversation summaries, plus anything run with `--model haiku`) from
 this stack while the main model stays on Anthropic, nginx routes each
 inference request by the `model` field of its body (`nginx/router.js`):
 
+- `model` listed in `SIDECAR_MODEL_NAMES` -> `SIDECAR_UPSTREAM`, a second
+  instance of this stack (see [sidecar](#sidecar-small-model-on-another-host))
 - `model` listed in `LOCAL_MODEL_NAMES` (comma-separated) -> local llama.cpp
 - any other model -> `PASSTHROUGH_UPSTREAM`, forwarded verbatim: headers
   (`Authorization`, `anthropic-beta`, ...), body, SSE stream and error bodies
@@ -237,6 +240,36 @@ variables changed). The server certificate must carry the hostname clients
 will use (`./scripts/setup.sh myjetson.lan` or regenerate it, see
 [TLS certificates](#tls-certificates-mutual-tls)). The same profile works on
 any host running this stack; only the model sizing is Jetson-specific.
+
+### Sidecar: small model on another host
+
+The small model can run on a different machine than the front door, e.g. the
+main stack on a workstation serving the reference model and a Jetson serving
+the small-model profile above. Clients then keep a single endpoint and a
+single client certificate. In the front door's `.env`:
+
+```bash
+SIDECAR_MODEL_NAMES=qwen3.5-4b
+SIDECAR_UPSTREAM=https://myjetson.lan:8443
+SIDECAR_CERTS_DIR=/home/me/.config/local-llm/jetson
+```
+
+`SIDECAR_CERTS_DIR` holds `ca.crt`, `client.crt` and `client.key` issued by
+the sidecar's own CA (`./scripts/gen-certs.sh --client NAME` on the sidecar,
+renamed to `client.crt`/`client.key`); keep it outside this repository. nginx
+presents that certificate to the sidecar and verifies the sidecar's server
+certificate against `ca.crt`, so `SIDECAR_UPSTREAM` must use a hostname in
+the sidecar's certificate SANs. The sidecar's own `LOCAL_MODEL_NAMES` must list
+the same names, or its `PASSTHROUGH_UPSTREAM` must be empty. Sidecar names
+win over `LOCAL_MODEL_NAMES`; an empty `SIDECAR_UPSTREAM` disables the leg.
+Apply with `docker compose up -d --force-recreate nginx`; `llama-server` is
+not touched. Requests on this leg appear with `"route":"sidecar"` in the
+access log.
+
+Use a name of your own for the small model (`qwen3.5-4b` above) rather than
+an Anthropic model ID: Claude Code is told the name through
+`ANTHROPIC_DEFAULT_HAIKU_MODEL`, so the routing stays valid when Anthropic
+renames its models.
 
 ### Client side
 
@@ -321,8 +354,18 @@ the browser (import `client.crt` + `client.key` as a PKCS#12 bundle:
 | Logs of every container in this project | Docker log driver | Grafana Alloy -> Loki |
 
 The nginx access log is JSON (status, timings, bytes, client certificate CN,
-user agent), so Loki can derive per-client request rates, latency percentiles
-and error counts without extra exporters. Provisioned dashboards live in
+user agent, routing leg and model, upstream status and connect/header times),
+so Loki can derive per-client request rates, latency percentiles and error
+counts without extra exporters. On the inference legs `nginx/router.js` also
+observes the response body without altering it and logs the usage block the
+backend reports (`usage_input`, `usage_output`, `usage_cache_read`,
+`usage_cache_creation`, in the backend's own convention: Anthropic
+`input_tokens` exclude cached tokens, OpenAI-format `prompt_tokens` include
+them) and llama.cpp's `timings` (`usage_prompt_ms`, `usage_predicted_ms`).
+This gives per-client, per-model and per-route token accounting across the
+local, sidecar and hosted legs; compressed responses (`Content-Encoding`) are
+not parsed and leave the fields empty. The "Routing" row of the nginx
+dashboard is built on these fields. Provisioned dashboards live in
 `observability/grafana/dashboards/` and are read-only in the UI; they are
 produced by `observability/grafana/gen-dashboards.py`, so edit that script and
 rerun it, Grafana reloads the files automatically.
