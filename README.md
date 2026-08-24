@@ -254,6 +254,12 @@ SIDECAR_UPSTREAM=https://myjetson.lan:8443
 SIDECAR_CERTS_DIR=/home/me/.config/local-llm/jetson
 ```
 
+nginx resolves the upstream through Docker DNS, which does not apply the
+host's search domains, so use a resolvable FQDN in `SIDECAR_UPSTREAM`. If the
+sidecar's server certificate lists a different name in its SANs (e.g. the
+bare hostname), set `SIDECAR_TLS_NAME` to a SAN name; it defaults to the
+`SIDECAR_UPSTREAM` host.
+
 `SIDECAR_CERTS_DIR` holds `ca.crt`, `client.crt` and `client.key` issued by
 the sidecar's own CA (`./scripts/gen-certs.sh --client NAME` on the sidecar,
 renamed to `client.crt`/`client.key`); keep it outside this repository. nginx

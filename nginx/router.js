@@ -44,6 +44,7 @@ function route(r) {
         r.variables.route = 'sidecar';
         r.variables.sidecar_upstream = sidecar.replace(/\/+$/, '');
         r.variables.sidecar_host = hostOf(sidecar);
+        r.variables.sidecar_ssl_name = process.env.SIDECAR_TLS_NAME || hostOf(sidecar);
         r.internalRedirect('@sidecar');
         return;
     }
