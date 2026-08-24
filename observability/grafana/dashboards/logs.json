@@ -48,7 +48,7 @@
   },
   "panels": [
     {
-      "id": 66,
+      "id": 80,
       "type": "timeseries",
       "title": "Log volume",
       "datasource": {
@@ -99,7 +99,7 @@
       }
     },
     {
-      "id": 67,
+      "id": 81,
       "type": "logs",
       "title": "Logs",
       "datasource": {

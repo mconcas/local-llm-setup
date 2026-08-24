@@ -13,3 +13,6 @@ docker-compose.override.yml
 
 # Python virtualenv
 .venv/
+
+# Deployment-specific Prometheus scrape jobs
+observability/prometheus/scrape.d/*.yml

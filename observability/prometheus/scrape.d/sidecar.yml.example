@@ -1,0 +1,34 @@
+# Scrape a sidecar host's metrics through its mTLS nginx (see README,
+# "Sidecar metrics"). Copy to <name>.yml (gitignored), set the target and
+# the TLS server name (a SAN of the sidecar's server certificate). The
+# certificates are the same client credentials the routing leg uses
+# (SIDECAR_CERTS_DIR, mounted at /etc/prometheus/sidecar-certs).
+scrape_configs:
+  - job_name: jetson-llama
+    scheme: https
+    metrics_path: /metrics/llama
+    static_configs:
+      - targets: ["myjetson.lan:8443"]
+    tls_config: &sidecar_tls
+      ca_file: /etc/prometheus/sidecar-certs/ca.crt
+      cert_file: /etc/prometheus/sidecar-certs/client.crt
+      key_file: /etc/prometheus/sidecar-certs/client.key
+      server_name: myjetson
+  - job_name: jetson-node
+    scheme: https
+    metrics_path: /metrics/node
+    static_configs:
+      - targets: ["myjetson.lan:8443"]
+    tls_config: *sidecar_tls
+  - job_name: jetson-nginx
+    scheme: https
+    metrics_path: /metrics/nginx
+    static_configs:
+      - targets: ["myjetson.lan:8443"]
+    tls_config: *sidecar_tls
+  - job_name: jetson-tegra
+    scheme: https
+    metrics_path: /metrics/tegra
+    static_configs:
+      - targets: ["myjetson.lan:8443"]
+    tls_config: *sidecar_tls

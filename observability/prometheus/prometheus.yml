@@ -2,6 +2,10 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Deployment-specific scrape jobs (e.g. a sidecar host), gitignored.
+scrape_config_files:
+  - /etc/prometheus/scrape.d/*.yml
+
 scrape_configs:
   - job_name: llama-server
     static_configs:

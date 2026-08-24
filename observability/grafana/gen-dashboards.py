@@ -244,6 +244,63 @@ host = [
 ]
 json.dump(dashboard("gpu-host", "GPU, host and containers", host, templating=[proj], tags=["gpu", "host"]), open(f"{OUT}/gpu-host.json", "w"), indent=2)
 
+
+# ── Jetson sidecar ───────────────────────────────────────────────
+JL = 'job="jetson-llama"'
+JN = 'job="jetson-node"'
+JX = 'job="jetson-nginx"'
+jetson = [
+    panel("stat", "llama-server up", [q(f'up{{{JL}}}')], 0, 0, 4, 4, thresholds=BIN["steps"], opts={"graphMode": "none"},
+          overrides=[{"matcher": {"id": "byName", "options": "Value"}, "properties": [{"id": "mappings", "value": [{"type": "value", "options": {"0": {"text": "DOWN"}, "1": {"text": "UP"}}}]}]}]),
+    panel("stat", "nginx up", [q(f'nginx_up{{{JX}}}')], 4, 0, 4, 4, thresholds=BIN["steps"], opts={"graphMode": "none"},
+          overrides=[{"matcher": {"id": "byName", "options": "Value"}, "properties": [{"id": "mappings", "value": [{"type": "value", "options": {"0": {"text": "DOWN"}, "1": {"text": "UP"}}}]}]}]),
+    panel("stat", "GPU load", [q('tegra_gpu_load_ratio * 100')], 8, 0, 4, 4, unit="percent", min_=0, max_=100, decimals=0),
+    panel("stat", "GPU frequency", [q('tegra_gpu_frequency_hertz')], 12, 0, 4, 4, unit="hertz", decimals=0,
+          desc="306 MHz idle floor; 1020 MHz max in 15 W mode, more under MAXN_SUPER"),
+    panel("stat", "Module power", [q('tegra_rail_power_watts{rail="VDD_IN"}')], 16, 0, 4, 4, unit="watt", decimals=1, thresholds=GYR(13, 22)),
+    panel("stat", "GPU temperature", [q(f'node_thermal_zone_temp{{{JN}, type="gpu-thermal"}}')], 20, 0, 4, 4, unit="celsius", decimals=0, thresholds=GYR(75, 90)),
+
+    panel("timeseries", "Token throughput", [
+        q(f'rate(llamacpp:tokens_predicted_total{{{JL}}}[$__rate_interval])', "generated tok/s"),
+        q(f'rate(llamacpp:prompt_tokens_total{{{JL}}}[$__rate_interval])', "prompt tok/s", i=1),
+        q(f'rate(llamacpp:prompt_tokens_cached_total{{{JL}}}[$__rate_interval])', "cached prompt tok/s", i=2),
+    ], 0, 4, 12, 8, unit="short", desc="Wall-clock averaged over the scrape window, so idle time lowers the value"),
+    panel("timeseries", "Effective speed while busy", [
+        q(f'rate(llamacpp:tokens_predicted_total{{{JL}}}[$__rate_interval]) / rate(llamacpp:tokens_predicted_seconds_total{{{JL}}}[$__rate_interval])', "decode tok/s"),
+        q(f'rate(llamacpp:prompt_tokens_total{{{JL}}}[$__rate_interval]) / rate(llamacpp:prompt_seconds_total{{{JL}}}[$__rate_interval])', "prompt tok/s", i=1),
+    ], 12, 4, 12, 8, unit="short", desc="Tokens divided by the time llama.cpp spent in that phase; the true model speed",
+          overrides=[{"matcher": {"id": "byName", "options": "prompt tok/s"}, "properties": [{"id": "custom.axisPlacement", "value": "right"}]}]),
+
+    panel("timeseries", "GPU", [
+        q('tegra_gpu_load_ratio * 100', "load %"),
+        q('tegra_gpu_frequency_hertz', "frequency", i=1),
+    ], 0, 12, 8, 8, unit="percent", min_=0,
+          overrides=[{"matcher": {"id": "byName", "options": "frequency"}, "properties": [{"id": "unit", "value": "hertz"}, {"id": "custom.axisPlacement", "value": "right"}]}]),
+    panel("timeseries", "Power rails", [q('tegra_rail_power_watts', "{{rail}}")], 8, 12, 8, 8, unit="watt", min_=0,
+          desc="INA3221 channels; VDD_IN is the whole module"),
+    panel("timeseries", "Temperatures", [
+        q(f'node_thermal_zone_temp{{{JN}, type=~"cpu-thermal|gpu-thermal|tj-thermal|soc[0-2]-thermal"}}', "{{type}}"),
+    ], 16, 12, 8, 8, unit="celsius"),
+
+    panel("timeseries", "Unified memory", [
+        q(f'node_memory_MemTotal_bytes{{{JN}}} - node_memory_MemAvailable_bytes{{{JN}}}', "used"),
+        q(f'node_memory_Cached_bytes{{{JN}}} + node_memory_Buffers_bytes{{{JN}}}', "cache+buffers", i=1),
+        q(f'node_memory_MemTotal_bytes{{{JN}}}', "total", i=2),
+        q(f'node_memory_SwapTotal_bytes{{{JN}}} - node_memory_SwapFree_bytes{{{JN}}}', "swap used", i=3),
+    ], 0, 20, 8, 8, unit="bytes", min_=0, desc="CPU and iGPU share this memory; weights are streamed with direct I/O (no page-cache copy)"),
+    panel("timeseries", "CPU", [
+        q(f'100 - avg(rate(node_cpu_seconds_total{{{JN}, mode="idle"}}[$__rate_interval])) * 100', "busy"),
+        q(f'avg(rate(node_cpu_seconds_total{{{JN}, mode="iowait"}}[$__rate_interval])) * 100', "iowait", i=1),
+    ], 8, 20, 8, 8, unit="percent", min_=0, max_=100, desc="Average over all cores"),
+    panel("timeseries", "Requests", [
+        q(f'llamacpp:requests_processing{{{JL}}}', "processing"),
+        q(f'llamacpp:requests_deferred{{{JL}}}', "queued", i=1),
+        q(f'rate(nginx_http_requests_total{{{JX}}}[$__rate_interval]) * 60', "nginx req/min", i=2),
+    ], 16, 20, 8, 8, decimals=1,
+          overrides=[{"matcher": {"id": "byName", "options": "nginx req/min"}, "properties": [{"id": "custom.axisPlacement", "value": "right"}]}]),
+]
+json.dump(dashboard("jetson-sidecar", "Jetson sidecar", jetson, tags=["jetson"], refresh="30s"), open(f"{OUT}/jetson-sidecar.json", "w"), indent=2)
+
 # ── Logs ─────────────────────────────────────────────────────────
 cvar = var_query("container", "Container", 'label_values(container)', ds=LOKI, current="All")
 svar = {"name": "search", "label": "Search", "type": "textbox", "query": "", "current": {"text": "", "value": ""}}

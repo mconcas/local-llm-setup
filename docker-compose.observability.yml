@@ -12,8 +12,13 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=${METRICS_RETENTION:-30d}
       - --web.enable-lifecycle
+    # Group 101 so the sidecar client key (0640, group 101 for the nginx
+    # workers) stays readable when scraping a sidecar host.
+    user: "65534:101"
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/scrape.d:/etc/prometheus/scrape.d:ro
+      - ${SIDECAR_CERTS_DIR:-./certs}:/etc/prometheus/sidecar-certs:ro
       - prometheus-data:/prometheus
     networks:
       - llm-net

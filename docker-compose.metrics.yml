@@ -1,0 +1,41 @@
+# Sidecar metrics agent: exporters for a host that is scraped by another
+# instance's Prometheus through this host's mTLS nginx (see README,
+# "Sidecar metrics"). Activate by appending :docker-compose.metrics.yml to
+# COMPOSE_FILE in .env. The tegra-exporter service only reports data on
+# Jetson hardware; elsewhere it serves an empty metrics page.
+services:
+  sidecar-node-exporter:
+    image: prom/node-exporter:v1.12.1
+    container_name: sidecar-node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(host/)?(sys|proc|dev|run|var/lib/docker/.+)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - llm-net
+
+  sidecar-nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.5.3
+    container_name: sidecar-nginx-exporter
+    restart: unless-stopped
+    command:
+      - --nginx.scrape-uri=http://nginx:8081/stub_status
+    depends_on:
+      - nginx
+    networks:
+      - llm-net
+
+  sidecar-tegra-exporter:
+    image: local/tegra-exporter
+    container_name: sidecar-tegra-exporter
+    pull_policy: build
+    build:
+      context: ./jetson/tegra-exporter
+    restart: unless-stopped
+    volumes:
+      - /sys:/sys:ro
+    networks:
+      - llm-net

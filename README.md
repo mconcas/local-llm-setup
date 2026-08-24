@@ -374,6 +374,28 @@ rerun it, Grafana reloads the files automatically.
 Retention is `METRICS_RETENTION` (Prometheus) and `LOGS_RETENTION` (Loki); data
 lives in the `prometheus-data`, `loki-data` and `grafana-data` volumes.
 
+### Sidecar metrics
+
+A [sidecar host](#sidecar-small-model-on-another-host) is monitored by the
+same stack without running Prometheus there. On the sidecar, append
+`:docker-compose.metrics.yml` to `COMPOSE_FILE`: it adds node-exporter,
+nginx-exporter and, on Jetson hardware, a small Tegra exporter
+(`jetson/tegra-exporter/`, iGPU load and frequency plus INA3221 rail power;
+temperatures and the rest come from node-exporter). nginx exposes them under
+the mTLS vhost as `/metrics/llama`, `/metrics/node`, `/metrics/nginx` and
+`/metrics/tegra` (resolved at request time, not access-logged), so the only
+open port stays 8443 and the client-certificate CA is the only access
+control.
+
+On the host running Prometheus, drop a scrape file into
+`observability/prometheus/scrape.d/` (gitignored; start from
+`sidecar.yml.example`): it scrapes those paths over HTTPS with the client
+credentials from `SIDECAR_CERTS_DIR`, which the observability compose file
+mounts read-only into the Prometheus container. Then
+`docker compose up -d --force-recreate prometheus`. The provisioned
+"Jetson sidecar" dashboard reads the `jetson-*` job names used in the
+example.
+
 ## NVIDIA Jetson (Orin / JetPack 6)
 
 The stack also runs on Jetson Orin devices (tested on an Orin Nano Super
