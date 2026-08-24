@@ -65,11 +65,8 @@ services:
       # client.key). Defaults to ./certs so the mount is valid when unused.
       - ${SIDECAR_CERTS_DIR:-./certs}:/etc/nginx/sidecar:ro
     environment:
-      # Model-based routing, see nginx/router.js. Empty PASSTHROUGH_UPSTREAM
-      # serves every request locally regardless of the model name; empty
-      # SIDECAR_UPSTREAM disables the sidecar leg.
-      LOCAL_MODEL_NAMES: ${LOCAL_MODEL_NAMES:-}
-      PASSTHROUGH_UPSTREAM: ${PASSTHROUGH_UPSTREAM:-}
+      # Model-based routing, see nginx/router.js. Empty SIDECAR_UPSTREAM
+      # disables the sidecar leg and serves every request locally.
       SIDECAR_MODEL_NAMES: ${SIDECAR_MODEL_NAMES:-}
       SIDECAR_UPSTREAM: ${SIDECAR_UPSTREAM:-}
       SIDECAR_TLS_NAME: ${SIDECAR_TLS_NAME:-}

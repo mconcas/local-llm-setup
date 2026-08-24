@@ -91,7 +91,6 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
 | `MODELS_DIR`   | `./models`           | Host directory bind-mounted at `/models`  |
 | `COMPOSE_FILE` | (unset)              | Extra compose files: Jetson override, observability add-on |
-| `LOCAL_MODEL_NAMES` / `PASSTHROUGH_UPSTREAM` | (unset) | Route inference requests by model name, see [small-model endpoint](#small-model-endpoint-for-claude-code) |
 | `SIDECAR_MODEL_NAMES` / `SIDECAR_UPSTREAM` / `SIDECAR_CERTS_DIR` | (unset) | Forward selected model names to a second instance of this stack, see [sidecar](#sidecar-small-model-on-another-host) |
 | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / (required) | Grafana login (observability add-on) |
 | `GRAFANA_ROOT_URL` | `https://localhost:8443/grafana/` | Public Grafana URL through nginx |
@@ -184,24 +183,23 @@ HTTPS endpoint above.
 ## Small-model endpoint for Claude Code
 
 Claude Code talks to one `ANTHROPIC_BASE_URL` for every model it uses, with
-no per-model endpoint. To serve only its Haiku-class model (background jobs
-such as conversation summaries, plus anything run with `--model haiku`) from
-this stack while the main model stays on Anthropic, nginx routes each
-inference request by the `model` field of its body (`nginx/router.js`):
+no per-model endpoint. To serve its Haiku-class model (background jobs such
+as conversation summaries, plus anything run with `--model haiku`) from a
+smaller, cheaper machine while the main model runs on the reference GPU,
+nginx routes each inference request by the `model` field of its body
+(`nginx/router.js`):
 
 - `model` listed in `SIDECAR_MODEL_NAMES` -> `SIDECAR_UPSTREAM`, a second
   instance of this stack (see [sidecar](#sidecar-small-model-on-another-host))
-- `model` listed in `LOCAL_MODEL_NAMES` (comma-separated) -> local llama.cpp
-- any other model -> `PASSTHROUGH_UPSTREAM`, forwarded verbatim: headers
-  (`Authorization`, `anthropic-beta`, ...), body, SSE stream and error bodies
-  pass through unchanged, so the claude.ai login or API key configured in
-  Claude Code keeps working and is never stored on the server
+- any other model -> local llama.cpp
+
+Requests never leave the deployment: there is deliberately no pass-through
+to a hosted API, so pointing a client here can never spend hosted-API
+credit. To use a hosted model, point the client at that provider instead.
 
 Routed paths are `/v1/messages`, `/v1/messages/count_tokens`,
 `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`; everything
-else (`/v1/models`, `/health`, `/grafana/`) stays local. With
-`PASSTHROUGH_UPSTREAM` empty every model name is served locally, which is the
-default and the previous behaviour.
+else (`/v1/models`, `/health`, `/grafana/`) stays local.
 
 ### Server side (Jetson Orin Nano 8 GB reference profile)
 
@@ -231,8 +229,6 @@ MODEL_FILE=/models/Qwen3.5-4B-UD-Q4_K_XL.gguf
 CHAT_TEMPLATE_FILE=/templates/qwen3.5-4b-relaxed.jinja
 CTX_SIZE=65536
 CHAT_TEMPLATE_KWARGS={"enable_thinking":false}
-LOCAL_MODEL_NAMES=qwen3.5-4b
-PASSTHROUGH_UPSTREAM=https://api.anthropic.com
 ```
 
 `docker compose up -d` (nginx needs `--force-recreate` when only the routing
@@ -264,10 +260,9 @@ bare hostname), set `SIDECAR_TLS_NAME` to a SAN name; it defaults to the
 the sidecar's own CA (`./scripts/gen-certs.sh --client NAME` on the sidecar,
 renamed to `client.crt`/`client.key`); keep it outside this repository. nginx
 presents that certificate to the sidecar and verifies the sidecar's server
-certificate against `ca.crt`, so `SIDECAR_UPSTREAM` must use a hostname in
-the sidecar's certificate SANs. The sidecar's own `LOCAL_MODEL_NAMES` must list
-the same names, or its `PASSTHROUGH_UPSTREAM` must be empty. Sidecar names
-win over `LOCAL_MODEL_NAMES`; an empty `SIDECAR_UPSTREAM` disables the leg.
+certificate against `ca.crt`. The sidecar serves any model name locally, so
+no configuration is needed there; an empty `SIDECAR_UPSTREAM` disables the
+leg here.
 Apply with `docker compose up -d --force-recreate nginx`; `llama-server` is
 not touched. Requests on this leg appear with `"route":"sidecar"` in the
 access log.
@@ -301,12 +296,12 @@ It copies `ca.crt`, `laptop.crt` and `laptop.key` to the client's
 }
 ```
 
-Do not set `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` unless you want
-pass-through traffic billed to that key: with only `ANTHROPIC_BASE_URL` set,
-the saved claude.ai login remains the credential. Verify with
-`claude --model haiku -p 'reply with pong'` (served locally; the nginx access
-log shows `upstream_status` from llama.cpp) and a normal session (pass-through).
-`claude --debug` prints `mTLS: Loaded client certificate` on startup.
+Set `ANTHROPIC_AUTH_TOKEN` to any placeholder (e.g. `not-needed`): mTLS is
+the real access control and no request is ever forwarded to a hosted API, so
+no hosted credential belongs in this configuration. Verify with
+`claude --model haiku -p 'reply with pong'`; the nginx access log shows
+`upstream_status` from llama.cpp. `claude --debug` prints
+`mTLS: Loaded client certificate` on startup.
 
 `ENABLE_TOOL_SEARCH=true` is not optional: a non-first-party
 `ANTHROPIC_BASE_URL` turns MCP tool search off, so Claude Code sends every
@@ -319,7 +314,7 @@ Control is disabled, fast-mode and WebFetch safety checks still call
 `api.anthropic.com` directly, `--model haiku` warns that the model ID is
 unrecognised and assumes a 200k window, and all Claude Code traffic now
 depends on this server being up. The access log records `model` and `route`
-(`local`/`passthrough`) per request.
+(`local`/`sidecar`) per request.
 
 Measured on the Orin Nano in its default 15 W mode (`nvpmodel` mode 0, GPU
 capped at 612 MHz): 280 prompt tok/s and 7 tok/s decode; a `--model haiku`

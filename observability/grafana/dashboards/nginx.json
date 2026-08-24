@@ -40,7 +40,7 @@
         "name": "route",
         "label": "Route",
         "type": "custom",
-        "query": ".*,local,sidecar,passthrough",
+        "query": ".*,local,sidecar",
         "current": {
           "text": ".*",
           "value": ".*"
@@ -59,11 +59,6 @@
           {
             "text": "sidecar",
             "value": "sidecar",
-            "selected": false
-          },
-          {
-            "text": "passthrough",
-            "value": "passthrough",
             "selected": false
           }
         ]
@@ -1163,7 +1158,7 @@
     {
       "id": 33,
       "type": "timeseries",
-      "title": "Cache read share (hosted leg)",
+      "title": "Cache read share by route",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -1177,12 +1172,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | usage_cache_read=~\"[0-9]+\" | unwrap usage_cache_read [$__auto])) / (sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | unwrap usage_input [$__auto])) + sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | usage_cache_read=~\"[0-9]+\" | unwrap usage_cache_read [$__auto])) + sum(sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | route=\"passthrough\" | usage_cache_creation=~\"[0-9]+\" | unwrap usage_cache_creation [$__auto])))",
+          "expr": "sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | usage_cache_read=~\"[0-9]+\" | unwrap usage_cache_read [$__auto])) / (sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | unwrap usage_input [$__auto])) + sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | usage_cache_read=~\"[0-9]+\" | unwrap usage_cache_read [$__auto])))",
           "datasource": {
             "type": "loki",
             "uid": "loki"
           },
-          "legendFormat": "cache read / all input"
+          "legendFormat": "{{route}}"
         }
       ],
       "fieldConfig": {
@@ -1211,7 +1206,8 @@
           "mode": "multi",
           "sort": "desc"
         }
-      }
+      },
+      "description": "llama.cpp reports cache_read_input_tokens in Anthropic-format responses"
     },
     {
       "id": 34,

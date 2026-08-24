@@ -101,8 +101,8 @@ NX = '{container="llama-proxy"} |= "\\"status\\":" | json'
 NXC = NX + ' | client_cn=~"$client_cn" | uri=~"$uri"'
 NXR = NXC + ' | route=~"$route" | route!=""'
 NXU = NXR + ' | usage_input=~"[0-9]+" | usage_output=~"[0-9]+"'
-route_var = {"name": "route", "label": "Route", "type": "custom", "query": ".*,local,sidecar,passthrough", "current": {"text": ".*", "value": ".*"},
-             "options": [{"text": ".*", "value": ".*", "selected": True}, {"text": "local", "value": "local", "selected": False}, {"text": "sidecar", "value": "sidecar", "selected": False}, {"text": "passthrough", "value": "passthrough", "selected": False}]}
+route_var = {"name": "route", "label": "Route", "type": "custom", "query": ".*,local,sidecar", "current": {"text": ".*", "value": ".*"},
+             "options": [{"text": ".*", "value": ".*", "selected": True}, {"text": "local", "value": "local", "selected": False}, {"text": "sidecar", "value": "sidecar", "selected": False}]}
 cn_var = {"name": "client_cn", "label": "Client CN", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}}
 uri_var = {"name": "uri", "label": "URI regex", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}}
 nginx = [
@@ -150,9 +150,9 @@ nginx = [
         q(f'sum by (route) (sum_over_time({NXU} | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) * 60', "cache read {{route}}", ds=LOKI, i=2),
         q(f'sum by (route) (sum_over_time({NXU} | usage_cache_creation=~"[0-9]+" | unwrap usage_cache_creation [$__auto])) * 60', "cache creation {{route}}", ds=LOKI, i=3),
     ], 0, 37, 12, 8, ds=LOKI, unit="short", desc="As reported by each backend in the response usage block; Anthropic input_tokens exclude cached tokens, OpenAI-format prompt_tokens include them"),
-    panel("timeseries", "Cache read share (hosted leg)", [
-        q(f'sum(sum_over_time({NXU} | route="passthrough" | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) / (sum(sum_over_time({NXU} | route="passthrough" | unwrap usage_input [$__auto])) + sum(sum_over_time({NXU} | route="passthrough" | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) + sum(sum_over_time({NXU} | route="passthrough" | usage_cache_creation=~"[0-9]+" | unwrap usage_cache_creation [$__auto])))', "cache read / all input", ds=LOKI),
-    ], 12, 37, 12, 8, ds=LOKI, unit="percentunit", min_=0, max_=1),
+    panel("timeseries", "Cache read share by route", [
+        q(f'sum by (route) (sum_over_time({NXU} | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) / (sum by (route) (sum_over_time({NXU} | unwrap usage_input [$__auto])) + sum by (route) (sum_over_time({NXU} | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])))', "{{route}}", ds=LOKI),
+    ], 12, 37, 12, 8, ds=LOKI, unit="percentunit", min_=0, max_=1, desc="llama.cpp reports cache_read_input_tokens in Anthropic-format responses"),
     panel("table", "Tokens by client and model (range)", [
         q(f'sum by (client_cn, route, model) (sum_over_time({NXU} | unwrap usage_input [$__range]))', ds=LOKI, instant=True, format="table"),
         q(f'sum by (client_cn, route, model) (sum_over_time({NXU} | unwrap usage_output [$__range]))', ds=LOKI, instant=True, format="table", i=1),

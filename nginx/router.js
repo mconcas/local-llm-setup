@@ -1,9 +1,7 @@
 // Route Anthropic/OpenAI-style inference requests by their `model` field:
 // names listed in SIDECAR_MODEL_NAMES go to SIDECAR_UPSTREAM (another
-// instance of this stack, reached with a client certificate), names listed
-// in LOCAL_MODEL_NAMES go to the local llama.cpp server, everything else to
-// PASSTHROUGH_UPSTREAM. With no PASSTHROUGH_UPSTREAM configured every
-// remaining request is served locally.
+// instance of this stack, reached with a client certificate), everything
+// else to the local llama.cpp server. Requests never leave the deployment.
 //
 // `usage` is a response body filter that forwards every chunk untouched and
 // records the token usage reported by the backend (Anthropic and OpenAI
@@ -36,7 +34,6 @@ function hostOf(upstream) {
 }
 
 function route(r) {
-    var passthrough = process.env.PASSTHROUGH_UPSTREAM || '';
     var sidecar = process.env.SIDECAR_UPSTREAM || '';
     var model = requestedModel(r);
     r.variables.routed_model = model;
@@ -48,15 +45,8 @@ function route(r) {
         r.internalRedirect('@sidecar');
         return;
     }
-    if (passthrough === '' || names('LOCAL_MODEL_NAMES').indexOf(model) !== -1) {
-        r.variables.route = 'local';
-        r.internalRedirect('@llama');
-        return;
-    }
-    r.variables.route = 'passthrough';
-    r.variables.passthrough_upstream = passthrough.replace(/\/+$/, '');
-    r.variables.passthrough_host = hostOf(passthrough);
-    r.internalRedirect('@passthrough');
+    r.variables.route = 'local';
+    r.internalRedirect('@llama');
 }
 
 function setNum(r, name, value) {

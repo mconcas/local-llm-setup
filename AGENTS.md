@@ -43,17 +43,19 @@ conversation before and after.
 `nginx/router.js` (njs) routes the inference paths by the body's `model` field:
 `SIDECAR_MODEL_NAMES` go to `SIDECAR_UPSTREAM` (a second instance of this stack,
 reached with the client cert in `SIDECAR_CERTS_DIR`, verified against that
-instance's CA, so the upstream hostname must be in its server-cert SANs),
-`LOCAL_MODEL_NAMES` go to llama.cpp, anything else to `PASSTHROUGH_UPSTREAM`
-(empty = everything local). All reach nginx as container env, so changing them
-needs `docker compose up -d --force-recreate nginx`. Test routing changes without
-touching the live stack: run a throwaway `nginx:alpine` on the compose network
-with the same mounts and env on another port. The routing location pins
-`client_body_buffer_size` to the body limit because njs only sees in-memory
-bodies. Pass-through must stay byte-transparent (headers, SSE, error bodies):
-Claude Code's retry logic matches upstream error wording. Test both legs after
-touching it: a request with a local model name and one with a foreign name,
-checking `upstream_status` in the JSON access log. `router.usage` is a
+instance's CA, so `SIDECAR_TLS_NAME` must be in its server-cert SANs), anything
+else to the local llama.cpp. There is deliberately NO pass-through to a hosted
+API (removed 2026-08-24): requests must never leave the deployment, and hosted
+models are reached only by pointing the client elsewhere (cc-switch frontier
+mode). Do not reintroduce a forwarding leg. The routing env reaches nginx as
+container env, so changes need `docker compose up -d --force-recreate nginx`.
+Test routing changes without touching the live stack: run a throwaway
+`nginx:alpine` on the compose network with the same mounts and env on another
+port. The routing location pins `client_body_buffer_size` to the body limit
+because njs only sees in-memory bodies. The sidecar leg must stay
+byte-transparent (headers, SSE, error bodies): Claude Code's retry logic
+matches upstream error wording. Test both legs after touching it, checking
+`upstream_status` in the JSON access log. `router.usage` is a
 `js_body_filter` on the three legs that must forward every chunk unchanged
 (`r.sendBuffer(data, flags)` first) and only parse the copy; verify byte
 identity against a direct fetch of the upstream after touching it (a fake

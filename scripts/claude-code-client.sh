@@ -23,11 +23,8 @@ set +a
 
 if [[ -n "${SIDECAR_UPSTREAM:-}" && -n "${SIDECAR_MODEL_NAMES:-}" ]]; then
   HAIKU_MODEL="${SIDECAR_MODEL_NAMES%%,*}"
-elif [[ -n "${LOCAL_MODEL_NAMES:-}" && -n "${PASSTHROUGH_UPSTREAM:-}" ]]; then
-  HAIKU_MODEL="${LOCAL_MODEL_NAMES%%,*}"
 else
-  echo "Error: set LOCAL_MODEL_NAMES and PASSTHROUGH_UPSTREAM (or SIDECAR_MODEL_NAMES and SIDECAR_UPSTREAM) in .env first (see README)." >&2
-  exit 1
+  HAIKU_MODEL="$(basename "${MODEL_FILE:?set MODEL_FILE in .env first}")"
 fi
 PORT="${HTTPS_PORT:-8443}"
 CLIENT_DIR='$HOME/.config/local-llm'
@@ -49,6 +46,7 @@ Add to ~/.claude/settings.json on the client (absolute paths, no ~):
 
   "env": {
     "ANTHROPIC_BASE_URL": "https://$SERVER_HOST:$PORT",
+    "ANTHROPIC_AUTH_TOKEN": "not-needed",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$HAIKU_MODEL",
     "ENABLE_TOOL_SEARCH": "true",
     "CLAUDE_CODE_CLIENT_CERT": "/home/USER/.config/local-llm/$NAME.crt",
