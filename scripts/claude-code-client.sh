@@ -21,12 +21,14 @@ set -a
 source .env
 set +a
 
-if [[ -z "${LOCAL_MODEL_NAMES:-}" || -z "${PASSTHROUGH_UPSTREAM:-}" ]]; then
-  echo "Error: set LOCAL_MODEL_NAMES and PASSTHROUGH_UPSTREAM in .env first (see README)." >&2
+if [[ -n "${SIDECAR_UPSTREAM:-}" && -n "${SIDECAR_MODEL_NAMES:-}" ]]; then
+  HAIKU_MODEL="${SIDECAR_MODEL_NAMES%%,*}"
+elif [[ -n "${LOCAL_MODEL_NAMES:-}" && -n "${PASSTHROUGH_UPSTREAM:-}" ]]; then
+  HAIKU_MODEL="${LOCAL_MODEL_NAMES%%,*}"
+else
+  echo "Error: set LOCAL_MODEL_NAMES and PASSTHROUGH_UPSTREAM (or SIDECAR_MODEL_NAMES and SIDECAR_UPSTREAM) in .env first (see README)." >&2
   exit 1
 fi
-
-HAIKU_MODEL="${LOCAL_MODEL_NAMES%%,*}"
 PORT="${HTTPS_PORT:-8443}"
 CLIENT_DIR='$HOME/.config/local-llm'
 

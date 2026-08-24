@@ -41,14 +41,25 @@ conversation before and after.
 ## Model routing in nginx
 
 `nginx/router.js` (njs) routes the inference paths by the body's `model` field:
+`SIDECAR_MODEL_NAMES` go to `SIDECAR_UPSTREAM` (a second instance of this stack,
+reached with the client cert in `SIDECAR_CERTS_DIR`, verified against that
+instance's CA, so the upstream hostname must be in its server-cert SANs),
 `LOCAL_MODEL_NAMES` go to llama.cpp, anything else to `PASSTHROUGH_UPSTREAM`
-(empty = everything local). Both reach nginx as container env, so changing them
-needs `docker compose up -d --force-recreate nginx`. The routing location pins
+(empty = everything local). All reach nginx as container env, so changing them
+needs `docker compose up -d --force-recreate nginx`. Test routing changes without
+touching the live stack: run a throwaway `nginx:alpine` on the compose network
+with the same mounts and env on another port. The routing location pins
 `client_body_buffer_size` to the body limit because njs only sees in-memory
 bodies. Pass-through must stay byte-transparent (headers, SSE, error bodies):
 Claude Code's retry logic matches upstream error wording. Test both legs after
 touching it: a request with a local model name and one with a foreign name,
-checking `upstream_status` in the JSON access log.
+checking `upstream_status` in the JSON access log. `router.usage` is a
+`js_body_filter` on the three legs that must forward every chunk unchanged
+(`r.sendBuffer(data, flags)` first) and only parse the copy; verify byte
+identity against a direct fetch of the upstream after touching it (a fake
+upstream emitting Anthropic SSE, OpenAI SSE and plain JSON is enough). Usage
+fields are empty strings when unknown, so LogQL must filter
+`usage_input=~"[0-9]+"` before `unwrap`.
 
 ## Observability add-on
 

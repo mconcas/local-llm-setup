@@ -99,6 +99,10 @@ json.dump(dashboard("llm-service", "LLM service", llm, tags=["llama.cpp"]), open
 # ── nginx ────────────────────────────────────────────────────────
 NX = '{container="llama-proxy"} |= "\\"status\\":" | json'
 NXC = NX + ' | client_cn=~"$client_cn" | uri=~"$uri"'
+NXR = NXC + ' | route=~"$route" | route!=""'
+NXU = NXR + ' | usage_input=~"[0-9]+" | usage_output=~"[0-9]+"'
+route_var = {"name": "route", "label": "Route", "type": "custom", "query": ".*,local,sidecar,passthrough", "current": {"text": ".*", "value": ".*"},
+             "options": [{"text": ".*", "value": ".*", "selected": True}, {"text": "local", "value": "local", "selected": False}, {"text": "sidecar", "value": "sidecar", "selected": False}, {"text": "passthrough", "value": "passthrough", "selected": False}]}
 cn_var = {"name": "client_cn", "label": "Client CN", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}}
 uri_var = {"name": "uri", "label": "URI regex", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}}
 nginx = [
@@ -127,29 +131,62 @@ nginx = [
         q(f'sum(rate({NXC} | unwrap request_length [$__auto]))', "received", ds=LOKI, i=1),
     ], 12, 12, 12, 8, ds=LOKI, unit="Bps"),
 
+    row("Routing", 20),
+    panel("timeseries", "Requests by route", [q(f'sum by (route) (rate({NXR} [$__auto])) * 60', "{{route}}", ds=LOKI)], 0, 21, 8, 8, ds=LOKI, unit="reqpm"),
+    panel("timeseries", "Requests by model", [q(f'sum by (model) (rate({NXR} [$__auto])) * 60', "{{model}}", ds=LOKI)], 8, 21, 8, 8, ds=LOKI, unit="reqpm"),
+    panel("timeseries", "Upstream status by route", [q(f'sum by (route, upstream_status) (rate({NXR} [$__auto])) * 60', "{{route}} {{upstream_status}}", ds=LOKI)], 16, 21, 8, 8, ds=LOKI, unit="reqpm",
+          overrides=[{"matcher": {"id": "byRegexp", "options": ".* 5.."}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+                     {"matcher": {"id": "byRegexp", "options": ".* 4.."}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}]),
+    panel("timeseries", "p95 request time by route", [q(f'quantile_over_time(0.95, {NXR} | unwrap request_time [$__auto]) by (route)', "{{route}}", ds=LOKI)], 0, 29, 8, 8, ds=LOKI, unit="s", desc="Full duration at nginx, streaming included"),
+    panel("timeseries", "p95 time to upstream headers by route", [q(f'quantile_over_time(0.95, {NXR} | upstream_header_time=~"[0-9.]+" | unwrap upstream_header_time [$__auto]) by (route)', "{{route}}", ds=LOKI)], 8, 29, 8, 8, ds=LOKI, unit="s",
+          desc="Connect plus time until the backend sent response headers. Not first-token time: llama.cpp sends headers before prompt processing"),
+    panel("timeseries", "llama.cpp timings (p95)", [
+        q(f'quantile_over_time(0.95, {NXR} | usage_prompt_ms=~"[0-9]+" | unwrap usage_prompt_ms [$__auto]) by (route)', "prompt {{route}}", ds=LOKI),
+        q(f'quantile_over_time(0.95, {NXR} | usage_predicted_ms=~"[0-9]+" | unwrap usage_predicted_ms [$__auto]) by (route)', "generation {{route}}", ds=LOKI, i=1),
+    ], 16, 29, 8, 8, ds=LOKI, unit="ms", desc="Backend-reported prompt-processing and generation time per request; only legs served by llama.cpp report it"),
+    panel("timeseries", "Tokens per minute by route", [
+        q(f'sum by (route) (sum_over_time({NXU} | unwrap usage_input [$__auto])) * 60', "input {{route}}", ds=LOKI),
+        q(f'sum by (route) (sum_over_time({NXU} | unwrap usage_output [$__auto])) * 60', "output {{route}}", ds=LOKI, i=1),
+        q(f'sum by (route) (sum_over_time({NXU} | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) * 60', "cache read {{route}}", ds=LOKI, i=2),
+        q(f'sum by (route) (sum_over_time({NXU} | usage_cache_creation=~"[0-9]+" | unwrap usage_cache_creation [$__auto])) * 60', "cache creation {{route}}", ds=LOKI, i=3),
+    ], 0, 37, 12, 8, ds=LOKI, unit="short", desc="As reported by each backend in the response usage block; Anthropic input_tokens exclude cached tokens, OpenAI-format prompt_tokens include them"),
+    panel("timeseries", "Cache read share (hosted leg)", [
+        q(f'sum(sum_over_time({NXU} | route="passthrough" | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) / (sum(sum_over_time({NXU} | route="passthrough" | unwrap usage_input [$__auto])) + sum(sum_over_time({NXU} | route="passthrough" | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) + sum(sum_over_time({NXU} | route="passthrough" | usage_cache_creation=~"[0-9]+" | unwrap usage_cache_creation [$__auto])))', "cache read / all input", ds=LOKI),
+    ], 12, 37, 12, 8, ds=LOKI, unit="percentunit", min_=0, max_=1),
+    panel("table", "Tokens by client and model (range)", [
+        q(f'sum by (client_cn, route, model) (sum_over_time({NXU} | unwrap usage_input [$__range]))', ds=LOKI, instant=True, format="table"),
+        q(f'sum by (client_cn, route, model) (sum_over_time({NXU} | unwrap usage_output [$__range]))', ds=LOKI, instant=True, format="table", i=1),
+        q(f'sum by (client_cn, route, model) (count_over_time({NXU} [$__range]))', ds=LOKI, instant=True, format="table", i=2),
+    ], 0, 45, 24, 9, ds=LOKI, opts={"sortBy": [{"displayName": "input tokens", "desc": True}]},
+          overrides=[{"matcher": {"id": "byName", "options": "Time"}, "properties": [{"id": "custom.hidden", "value": True}]},
+                     {"matcher": {"id": "byName", "options": "Value #A"}, "properties": [{"id": "displayName", "value": "input tokens"}, {"id": "custom.width", "value": 130}]},
+                     {"matcher": {"id": "byName", "options": "Value #B"}, "properties": [{"id": "displayName", "value": "output tokens"}, {"id": "custom.width", "value": 130}]},
+                     {"matcher": {"id": "byName", "options": "Value #C"}, "properties": [{"id": "displayName", "value": "requests"}, {"id": "custom.width", "value": 110}]}]),
+
+    row("Connections", 54),
     panel("timeseries", "Connections", [
         q('nginx_connections_active', "active"), q('nginx_connections_reading', "reading", i=1),
         q('nginx_connections_writing', "writing", i=2), q('nginx_connections_waiting', "waiting", i=3),
-    ], 0, 20, 12, 8, decimals=0),
+    ], 0, 55, 12, 8, decimals=0),
     panel("timeseries", "Accepted vs handled", [
         q('rate(nginx_connections_accepted[$__rate_interval])', "accepted/s"),
         q('rate(nginx_connections_handled[$__rate_interval])', "handled/s", i=1),
-    ], 12, 20, 12, 8, unit="ops", desc="A gap means nginx dropped connections (worker_connections exhausted)"),
+    ], 12, 55, 12, 8, unit="ops", desc="A gap means nginx dropped connections (worker_connections exhausted)"),
 
-    panel("table", "Top URIs (range)", [q(f'topk(10, sum by (uri, method) (count_over_time({NXC} [$__range])))', ds=LOKI, instant=True, format="table")], 0, 28, 12, 9, ds=LOKI,
+    panel("table", "Top URIs (range)", [q(f'topk(10, sum by (uri, method) (count_over_time({NXC} [$__range])))', ds=LOKI, instant=True, format="table")], 0, 63, 12, 9, ds=LOKI,
           opts={"sortBy": [{"displayName": "Value", "desc": True}]},
           overrides=[{"matcher": {"id": "byName", "options": "Time"}, "properties": [{"id": "custom.hidden", "value": True}]},
                      {"matcher": {"id": "byName", "options": "Value #A"}, "properties": [{"id": "displayName", "value": "requests"}, {"id": "custom.width", "value": 110}]}]),
-    panel("table", "Top user agents (range)", [q(f'topk(10, sum by (user_agent) (count_over_time({NXC} [$__range])))', ds=LOKI, instant=True, format="table")], 12, 28, 12, 9, ds=LOKI,
+    panel("table", "Top user agents (range)", [q(f'topk(10, sum by (user_agent) (count_over_time({NXC} [$__range])))', ds=LOKI, instant=True, format="table")], 12, 63, 12, 9, ds=LOKI,
           opts={"sortBy": [{"displayName": "Value", "desc": True}]},
           overrides=[{"matcher": {"id": "byName", "options": "Time"}, "properties": [{"id": "custom.hidden", "value": True}]},
                      {"matcher": {"id": "byName", "options": "Value #A"}, "properties": [{"id": "displayName", "value": "requests"}, {"id": "custom.width", "value": 110}]}]),
-    panel("logs", "Access log", [q(f'{NXC} | line_format "{{{{.status}}}} {{{{.method}}}} {{{{.uri}}}} {{{{.request_time}}}}s cn={{{{.client_cn}}}} {{{{.client}}}} {{{{.user_agent}}}}"', ds=LOKI)], 0, 37, 24, 10, ds=LOKI,
+    panel("logs", "Access log", [q(f'{NXC} | line_format "{{{{.status}}}} {{{{.method}}}} {{{{.uri}}}} {{{{.request_time}}}}s cn={{{{.client_cn}}}} {{{{.client}}}} {{{{.user_agent}}}}"', ds=LOKI)], 0, 72, 24, 10, ds=LOKI,
           opts={"showTime": True, "wrapLogMessage": False, "sortOrder": "Descending", "dedupStrategy": "none", "enableLogDetails": True}),
-    panel("logs", "nginx error log", [q('{container="llama-proxy"} != "\\"status\\":"', ds=LOKI)], 0, 47, 24, 8, ds=LOKI,
+    panel("logs", "nginx error log", [q('{container="llama-proxy"} != "\\"status\\":"', ds=LOKI)], 0, 82, 24, 8, ds=LOKI,
           opts={"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending", "dedupStrategy": "none", "enableLogDetails": True}),
 ]
-json.dump(dashboard("nginx", "nginx (mTLS front end)", nginx, templating=[cn_var, uri_var], tags=["nginx"]), open(f"{OUT}/nginx.json", "w"), indent=2)
+json.dump(dashboard("nginx", "nginx (mTLS front end)", nginx, templating=[cn_var, uri_var, route_var], tags=["nginx"]), open(f"{OUT}/nginx.json", "w"), indent=2)
 
 # ── GPU + host + containers ──────────────────────────────────────
 G = 'job="dcgm"'
