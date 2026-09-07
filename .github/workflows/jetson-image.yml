@@ -95,7 +95,8 @@ jobs:
           set -euo pipefail
           image="${IMAGE,,}:${REF}"
           docker build --build-arg "LLAMA_CPP_REF=${REF}" --build-arg "BUILD_JOBS=$(nproc)" -t "$image" jetson
-          docker run --rm "$image" --version
+          missing=$(docker run --rm --entrypoint ldd "$image" /app/llama-server | awk '/not found/ {print $1}')
+          [ "$missing" = "libcuda.so.1" ] || { echo "unexpected unresolved libraries: ${missing:-none}" >&2; exit 1; }
           echo "image=${image}" >> "$GITHUB_ENV"
       - name: Push
         run: docker push "$image"
