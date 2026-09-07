@@ -11,6 +11,10 @@ on:
         description: "Rebuild even if the image tag already exists"
         type: boolean
         default: false
+  push:
+    paths:
+      - jetson/Dockerfile
+      - .github/workflows/jetson-image.yml
   schedule:
     - cron: "17 5 * * 1"
 
