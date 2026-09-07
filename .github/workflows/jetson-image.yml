@@ -1,0 +1,135 @@
+name: jetson-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_cpp_ref:
+        description: "llama.cpp build tag (bNNNN); empty picks the newest upstream release"
+        required: false
+        default: ""
+      rebuild:
+        description: "Rebuild even if the image tag already exists"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - jetson/Dockerfile
+      - .github/workflows/jetson-image.yml
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/llama-server-jetson
+  UPSTREAM: ggml-org/llama.cpp
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick the llama.cpp build tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.llama_cpp_ref }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          ghcr_tags() {
+            local repo="$1" token
+            token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token)
+            local url="https://ghcr.io/v2/${repo}/tags/list?n=1000"
+            while [ -n "$url" ]; do
+              local resp
+              resp=$(curl -fsS -D /tmp/h -H "Authorization: Bearer ${token}" "$url")
+              jq -r '.tags[]' <<<"$resp"
+              url=$(sed -n 's/.*<\([^>]*\)>; rel="next".*/https:\/\/ghcr.io\1/p' /tmp/h | head -1)
+            done
+          }
+          if [ -n "$INPUT_REF" ]; then
+            ref="$INPUT_REF"
+          else
+            release=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+            sha=$(git ls-remote --tags "https://github.com/${UPSTREAM}" "refs/tags/${release}^{}" "refs/tags/${release}" | tail -1 | cut -f1)
+            build=$(git ls-remote --tags "https://github.com/${UPSTREAM}" 'refs/tags/b*' | awk -v s="$sha" '$1==s {sub("refs/tags/","",$2); print $2}' | grep -E '^b[0-9]+$' | head -1)
+            [ -n "$build" ] || { echo "no bNNNN tag at ${release} (${sha})" >&2; exit 1; }
+            n=${build#b}
+            ref=$(ghcr_tags "$UPSTREAM" | sed -n 's/^server-cuda-b\([0-9]*\)$/\1/p' | sort -n | awk -v n="$n" '$1>=n {print "b"$1; exit}')
+            [ -n "$ref" ] || { echo "no upstream server-cuda image at or after ${build}" >&2; exit 1; }
+            echo "release ${release} is ${build}; nearest published x86 image is ${ref}"
+          fi
+          [[ "$ref" =~ ^b[0-9]+$ ]] || { echo "ref must be a bNNNN tag, got '${ref}'" >&2; exit 1; }
+          if [ "$REBUILD" != "true" ] && ghcr_tags "${GITHUB_REPOSITORY,,}/llama-server-jetson" 2>/dev/null | grep -qx "$ref"; then
+            echo "image ${ref} already published, skipping the build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af >/dev/null
+          df -h /
+      - name: Log in to ghcr.io
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build
+        env:
+          REF: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE,,}:${REF}"
+          docker build --build-arg "LLAMA_CPP_REF=${REF}" --build-arg "BUILD_JOBS=$(nproc)" -t "$image" jetson
+          missing=$(docker run --rm --entrypoint ldd "$image" /app/llama-server | awk '/not found/ {print $1}')
+          [ "$missing" = "libcuda.so.1" ] || { echo "unexpected unresolved libraries: ${missing:-none}" >&2; exit 1; }
+          echo "image=${image}" >> "$GITHUB_ENV"
+      - name: Push
+        run: docker push "$image"
+
+  bump:
+    needs: [resolve, build]
+    if: always() && needs.resolve.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin both containers to the new build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s#(ghcr.io/ggml-org/llama.cpp:server-cuda-)b[0-9]+#\1${REF}#" docker-compose.yml
+          sed -i -E "s#(llama-server-jetson:)b[0-9]+#\1${REF}#" docker-compose.jetson.yml
+          sed -i -E "s#^ARG LLAMA_CPP_REF=b[0-9]+#ARG LLAMA_CPP_REF=${REF}#" jetson/Dockerfile
+          if git diff --quiet; then
+            echo "already pinned to ${REF}"
+            exit 0
+          fi
+          branch="bump/llama-cpp-${REF}"
+          if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qx 1; then
+            echo "bump PR for ${REF} already open"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "Pin llama.cpp to ${REF} on both containers"
+          git push -u origin "$branch"
+          gh pr create --base "${GITHUB_REF_NAME}" --head "$branch" \
+            --title "Pin llama.cpp to ${REF} on both containers" \
+            --body "Built and published \`${IMAGE,,}:${REF}\`; the x86 default moves to the upstream \`server-cuda-${REF}\` image. Deploy to a host by recreating \`llama-server\` after merging, and replay the tool-schema regression request through both routing legs before closing."

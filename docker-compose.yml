@@ -1,7 +1,7 @@
 services:
   # ── llama.cpp server (CUDA) ──────────────────────────────────────
   llama-server:
-    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda-b10818}
     container_name: llama-server
     restart: unless-stopped
     volumes:

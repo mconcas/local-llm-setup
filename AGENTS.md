@@ -24,6 +24,18 @@ mounts: after editing them run `docker compose up -d --force-recreate nginx`; an
 old inode. Verify enforcement with one certless curl (expect 400) and one with
 `--cert/--key` (expect 200).
 
+## llama.cpp images are pinned per build
+
+Both compose files default to the same llama.cpp build tag (`server-cuda-bNNNN`
+upstream for x86, `ghcr.io/mconcas/local-llm-setup/llama-server-jetson:bNNNN`
+from `.github/workflows/jetson-image.yml` for the Jetson); never point them at a
+floating tag. The workflow's bump PR moves both. Regression-check an upgrade with
+an Anthropic-API request carrying a tool whose schema has a `pattern` with a
+lookahead and `\-` in a character class (Claude Code's Artifact tool does), on
+both routing legs; builds before b10818 answer 400 "failed to parse grammar".
+Test a candidate build without touching the live server: run it as a throwaway
+CPU-only container (`-ngl 0`) on the same model and template.
+
 ## Chat template override is model-specific
 
 `llama-server` runs with `LLAMA_ARG_CHAT_TEMPLATE_FILE` (default in `docker-compose.yml`,

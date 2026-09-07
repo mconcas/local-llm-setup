@@ -63,9 +63,10 @@ the largest power-of-two window that fits; decode runs at ~60 tok/s. The
 model emits thinking output, so give clients a generous `max_tokens`.
 Sampling defaults ship in the GGUF (temperature 1.0, top_k 20, top_p 0.95).
 
-Requires a llama.cpp build of b10499 or newer: older `server-cuda` images
+Requires a llama.cpp build of b10818 or newer: older `server-cuda` images
 (e.g. May 2026) produce garbage output for this model via a DeltaNet CUDA
-bug. The chat template must be the matching relaxed Qwen3.8 file (see
+bug, and builds before b10818 reject Claude Code's tool schemas with
+`Failed to initialize samplers: failed to parse grammar`. The chat template must be the matching relaxed Qwen3.8 file (see
 `CHAT_TEMPLATE_FILE` in `.env.example`);
 `templates/devstral-small-2-relaxed.jinja` remains available for the previous
 Devstral Small 2 reference model.
@@ -88,7 +89,7 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `CHAT_TEMPLATE_KWARGS` | `{}`         | Extra chat-template variables, e.g. `{"enable_thinking":false}` |
 | `CACHE_TYPE_K` | `q8_0`               | KV-cache key quantisation (`f16`, `q8_0`) |
 | `CACHE_TYPE_V` | `q8_0`               | KV-cache value quantisation               |
-| `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda` | llama.cpp server image |
+| `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda-b10818` | llama.cpp server image, pinned per build; the Jetson override pins the matching `llama-server-jetson` build |
 | `MODELS_DIR`   | `./models`           | Host directory bind-mounted at `/models`  |
 | `COMPOSE_FILE` | (unset)              | Extra compose files: Jetson override, observability add-on |
 | `SIDECAR_MODEL_NAMES` / `SIDECAR_UPSTREAM` / `SIDECAR_CERTS_DIR` | (unset) | Forward selected model names to a second instance of this stack, see [sidecar](#sidecar-small-model-on-another-host) |
@@ -403,18 +404,32 @@ Developer Kit, L4T r36.4.7 / CUDA 12.6). The upstream `server-cuda` image does
 not work there: its arm64 variant is built with CUDA 12.8 for server-class
 GPUs and ships no `sm_87` cubin, so model load aborts with *"the provided PTX
 was compiled with an unsupported toolchain"*. `jetson/Dockerfile` instead
-builds the same pinned llama.cpp release on the device, against the L4T CUDA
-toolchain and with a native `sm_87` kernel image.
+builds the same pinned llama.cpp build against the L4T CUDA toolchain with a
+native `sm_87` kernel image and the Orin's CPU target. The
+`jetson-image` workflow builds it on a GitHub arm64 runner and publishes
+`ghcr.io/mconcas/local-llm-setup/llama-server-jetson:bNNNN`, which
+`docker-compose.jetson.yml` pins; nothing is compiled on the device.
 
 ```bash
 # On the Jetson (requires JetPack 6 and Docker with the nvidia runtime):
 ./scripts/setup.sh myjetson.lan
 echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.jetson.yml' >> .env
 
-docker compose build     # one-time on-device build of llama-server
 docker compose up -d
 curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
   https://localhost:8443/v1/models
+```
+
+Upgrading llama.cpp: the workflow runs weekly, resolves the newest upstream
+release to the nearest published `server-cuda-bNNNN` image, builds the Jetson
+image for that same build and opens a pull request pinning both compose
+defaults. Run it manually with `gh workflow run jetson-image -f
+llama_cpp_ref=bNNNN` for a specific build. To build on the device instead
+(offline, or a fork without the workflow):
+
+```bash
+docker build --build-arg LLAMA_CPP_REF=bNNNN -t local/llama-server-jetson:bNNNN jetson
+echo 'LLAMA_IMAGE=local/llama-server-jetson:bNNNN' >> .env
 ```
 
 Sizing for an 8 GB Orin Nano, where CPU and GPU share ~7.4 GiB of unified
