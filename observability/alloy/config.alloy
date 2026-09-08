@@ -106,3 +106,81 @@ loki.write "default" {
     url = "http://loki:3100/loki/api/v1/push"
   }
 }
+
+otelcol.receiver.otlp "claude_code" {
+  http {
+    endpoint         = "0.0.0.0:4318"
+    include_metadata = true
+  }
+
+  output {
+    metrics = [otelcol.processor.attributes.host.input]
+    logs    = [otelcol.processor.attributes.host.input]
+    traces  = [otelcol.processor.attributes.host.input]
+  }
+}
+
+otelcol.processor.attributes "host" {
+  action {
+    key          = "host.name"
+    from_context = "metadata.x-host-name"
+    action       = "upsert"
+  }
+
+  output {
+    metrics = [otelcol.processor.groupbyattrs.host.input]
+    logs    = [otelcol.processor.groupbyattrs.host.input]
+    traces  = [otelcol.processor.groupbyattrs.host.input]
+  }
+}
+
+otelcol.processor.groupbyattrs "host" {
+  keys = ["host.name"]
+
+  output {
+    metrics = [otelcol.processor.batch.otlp.input]
+    logs    = [otelcol.processor.attributes.log_dedupe.input]
+    traces  = [otelcol.processor.batch.otlp.input]
+  }
+}
+
+otelcol.processor.attributes "log_dedupe" {
+  action {
+    key    = "gen_ai.provider.name"
+    action = "delete"
+  }
+
+  output {
+    logs = [otelcol.processor.batch.otlp.input]
+  }
+}
+
+otelcol.processor.batch "otlp" {
+  output {
+    metrics = [otelcol.exporter.otlphttp.prometheus.input]
+    logs    = [otelcol.exporter.otlphttp.loki.input]
+    traces  = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.exporter.otlphttp "prometheus" {
+  client {
+    endpoint = "http://prometheus:9090/api/v1/otlp"
+  }
+}
+
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "http://loki:3100/otlp"
+  }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+
+    tls {
+      insecure = true
+    }
+  }
+}

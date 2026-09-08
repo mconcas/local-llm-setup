@@ -96,7 +96,7 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `SIDECAR_MODEL_NAMES` / `SIDECAR_UPSTREAM` / `SIDECAR_CERTS_DIR` | (unset) | Forward selected model names to a second instance of this stack, see [sidecar](#sidecar-small-model-on-another-host) |
 | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / (required) | Grafana login (observability add-on) |
 | `GRAFANA_ROOT_URL` | `https://localhost:8443/grafana/` | Public Grafana URL through nginx |
-| `METRICS_RETENTION` / `LOGS_RETENTION` | `30d` / `720h` | Prometheus / Loki retention |
+| `METRICS_RETENTION` / `LOGS_RETENTION` / `TRACES_RETENTION` | `30d` / `720h` / `720h` | Prometheus / Loki / Tempo retention |
 
 Setting both cache types to `q8_0` halves KV-cache memory versus `f16`; this
 is what lets `CTX_SIZE=131072` fit alongside the reference model's Q6_K
@@ -327,12 +327,13 @@ before the first token, and background jobs are shorter. Switch to
 before judging latency; both need root and were not applied on the test
 device.
 
-## Observability (metrics, logs, dashboards)
+## Observability (metrics, logs, traces, dashboards)
 
-`docker-compose.observability.yml` adds a Prometheus + Loki + Grafana stack that
-joins the same Docker network. Nothing in it publishes a host port: Grafana is
-served by nginx under `/grafana/` on the existing mTLS vhost, so the same client
-certificates gate it.
+`docker-compose.observability.yml` adds a Prometheus + Loki + Tempo + Grafana
+stack that joins the same Docker network. Nothing in it publishes a host port:
+Grafana is served by nginx under `/grafana/` on the existing mTLS vhost, so the
+same client certificates gate it, and the OTLP ingest path below sits behind
+the same vhost.
 
 ```bash
 # .env
@@ -355,9 +356,11 @@ the browser (import `client.crt` + `client.key` as a PKCS#12 bundle:
 | Host CPU / memory / disk / network | node-exporter | Prometheus |
 | Per-container CPU / memory / network | cAdvisor | Prometheus |
 | Logs of every container in this project | Docker log driver | Grafana Alloy -> Loki |
+| Claude Code sessions (metrics, events, traces) | OTLP over HTTPS at `/otlp/` | Grafana Alloy -> Prometheus, Loki, Tempo |
 
 The nginx access log is JSON (status, timings, bytes, client certificate CN,
-user agent, routing leg and model, upstream status and connect/header times),
+user agent, routing leg and model, upstream status and connect/header times,
+and the W3C `traceparent` header when the client sends one),
 so Loki can derive per-client request rates, latency percentiles and error
 counts without extra exporters. On the inference legs `nginx/router.js` also
 observes the response body without altering it and logs the usage block the
@@ -373,8 +376,74 @@ dashboard is built on these fields. Provisioned dashboards live in
 produced by `observability/grafana/gen-dashboards.py`, so edit that script and
 rerun it, Grafana reloads the files automatically.
 
-Retention is `METRICS_RETENTION` (Prometheus) and `LOGS_RETENTION` (Loki); data
-lives in the `prometheus-data`, `loki-data` and `grafana-data` volumes.
+Retention is `METRICS_RETENTION` (Prometheus), `LOGS_RETENTION` (Loki) and
+`TRACES_RETENTION` (Tempo); data lives in the `prometheus-data`, `loki-data`,
+`tempo-data` and `grafana-data` volumes.
+
+### Claude Code telemetry
+
+Claude Code can export its own OpenTelemetry metrics, events and traces. nginx
+accepts them at `/otlp/` on the mTLS vhost (not access-logged, the exports are
+periodic) and hands them to Alloy, which fans them out: metrics to Prometheus's
+native OTLP receiver, events to Loki's OTLP endpoint, spans to Tempo. Client
+settings, in `~/.claude/settings.json` on each machine that has a client
+certificate:
+
+```json
+"env": {
+  "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+  "OTEL_METRICS_EXPORTER": "otlp",
+  "OTEL_LOGS_EXPORTER": "otlp",
+  "OTEL_TRACES_EXPORTER": "otlp",
+  "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+  "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+  "OTEL_EXPORTER_OTLP_ENDPOINT": "https://<host>:8443/otlp",
+  "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "cumulative",
+  "OTEL_RESOURCE_ATTRIBUTES": "gen_ai.provider.name=llama_cpp",
+  "NODE_EXTRA_CA_CERTS": "/home/me/.config/local-llm/ca.crt",
+  "CLAUDE_CODE_CLIENT_CERT": "/home/me/.config/local-llm/laptop.crt",
+  "CLAUDE_CODE_CLIENT_KEY": "/home/me/.config/local-llm/laptop.key"
+}
+```
+
+The exporter uses the same client certificate variables as the inference
+connection, so a session that talks to `api.anthropic.com` can still export
+here as long as those three variables are set. `cumulative` temporality is what
+Prometheus's receiver ingests without its experimental delta conversion. Every
+session is its own set of series (`session_id` label), and a counter that
+appears with a non-zero first value is invisible to `increase()`, so Prometheus
+runs with `created-timestamp-zero-ingestion`: the OTLP start timestamp becomes
+a zero sample just before the first export, and rates and increases count the
+whole session. Range totals in the dashboard use
+`last_over_time - min_over_time` per series rather than `increase`, which
+extrapolates.
+Traces are a Claude Code beta behind `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`;
+`CLAUDE_CODE_PROPAGATE_TRACEPARENT=1` additionally makes the client send its
+`traceparent` header to this proxy, which the access log records.
+
+Two attributes tell sessions apart in every dashboard:
+
+- `gen_ai.provider.name`, set by the client in `OTEL_RESOURCE_ATTRIBUTES`
+  (`anthropic` for the hosted API, `llama_cpp` for this stack). Claude Code
+  emits nothing that says which backend served a session, and the per-request
+  `model` name does not reach the session-level metrics, so the client has to
+  say it.
+- `host.name`, which Claude Code's resource does not carry either. Alloy takes
+  it from an `X-Host-Name` request header, so a client sets it with an
+  `otelHeadersHelper` script in `settings.json` that prints
+  `{"X-Host-Name": "<hostname>"}`.
+
+Both become Prometheus labels (`gen_ai_provider_name`, `host_name`), Loki
+stream labels and Tempo resource attributes. Events land in Loki as the stream
+`{service_name="claude-code"}` with every event attribute in structured
+metadata (`| event_name="api_request"`), and carry `trace_id`, which the Loki
+datasource links to Tempo. What the events contain is decided on the client:
+`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_ASSISTANT_RESPONSES`,
+`OTEL_LOG_TOOL_CONTENT` and `OTEL_LOG_RAW_API_BODIES` each default to off and
+are honoured as `0`/`1`. Note that `claude_code.cost.usage` and the
+`cost_usd` event attribute are Claude Code's estimate at Anthropic list prices
+for whatever model name it saw, so for `llama_cpp` sessions they are not a
+cost; the "Claude Code" dashboard only sums them for `anthropic`.
 
 ### Sidecar metrics
 

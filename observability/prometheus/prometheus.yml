@@ -2,6 +2,19 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# OTLP metrics pushed by Claude Code sessions through Alloy
+# (--web.enable-otlp-receiver in docker-compose.observability.yml).
+otlp:
+  promote_resource_attributes:
+    - service.name
+    - service.version
+    - host.name
+    - gen_ai.provider.name
+
+storage:
+  tsdb:
+    out_of_order_time_window: 30m
+
 # Deployment-specific scrape jobs (e.g. a sidecar host), gitignored.
 scrape_config_files:
   - /etc/prometheus/scrape.d/*.yml

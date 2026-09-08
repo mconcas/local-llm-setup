@@ -1,4 +1,5 @@
-# Observability add-on: Prometheus metrics, Loki logs, Grafana dashboards.
+# Observability add-on: Prometheus metrics, Loki logs, Tempo traces, Grafana
+# dashboards, and an OTLP ingest path for Claude Code sessions via Alloy.
 # Activate with COMPOSE_FILE=docker-compose.yml:docker-compose.observability.yml
 # in .env, or pass both files with -f. Grafana is served by nginx under
 # /grafana/ behind the same mTLS vhost; nothing here publishes a host port.
@@ -12,6 +13,8 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=${METRICS_RETENTION:-30d}
       - --web.enable-lifecycle
+      - --web.enable-otlp-receiver
+      - --enable-feature=created-timestamp-zero-ingestion
     # Group 101 so the sidecar client key (0640, group 101 for the nginx
     # workers) stays readable when scraping a sidecar host.
     user: "65534:101"
@@ -53,6 +56,23 @@ services:
       - alloy-data:/var/lib/alloy/data
     depends_on:
       - loki
+      - tempo
+    networks:
+      - llm-net
+
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: llm-tempo
+    restart: unless-stopped
+    command:
+      - -target=all
+      - -config.file=/etc/tempo/config.yml
+      - -config.expand-env=true
+    environment:
+      TRACES_RETENTION: ${TRACES_RETENTION:-720h}
+    volumes:
+      - ./observability/tempo/config.yml:/etc/tempo/config.yml:ro
+      - tempo-data:/var/tempo
     networks:
       - llm-net
 
@@ -76,6 +96,7 @@ services:
     depends_on:
       - prometheus
       - loki
+      - tempo
     networks:
       - llm-net
 
@@ -142,5 +163,6 @@ services:
 volumes:
   prometheus-data:
   loki-data:
+  tempo-data:
   alloy-data:
   grafana-data:

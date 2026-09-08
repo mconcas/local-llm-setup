@@ -42,7 +42,8 @@ Copy to the client machine (keep $NAME.key private):
   mkdir -p $CLIENT_DIR
   scp $(whoami)@$SERVER_HOST:$PROJECT_DIR/certs/{ca.crt,$NAME.crt,$NAME.key} $CLIENT_DIR/
 
-Add to ~/.claude/settings.json on the client (absolute paths, no ~):
+Add to ~/.claude/settings.json on the client (absolute paths, no ~ and no
+\$HOME: settings values are not shell-expanded):
 
   "env": {
     "ANTHROPIC_BASE_URL": "https://$SERVER_HOST:$PORT",
@@ -53,6 +54,22 @@ Add to ~/.claude/settings.json on the client (absolute paths, no ~):
     "CLAUDE_CODE_CLIENT_KEY": "/home/USER/.config/local-llm/$NAME.key",
     "NODE_EXTRA_CA_CERTS": "/home/USER/.config/local-llm/ca.crt"
   }
+
+With the observability add-on running, the same block can also export the
+session's own OpenTelemetry metrics, events and traces to this server
+(README, "Claude Code telemetry"); the certificate variables above are what
+the exporter authenticates with:
+
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_TRACES_EXPORTER": "otlp",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://$SERVER_HOST:$PORT/otlp",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "cumulative",
+    "OTEL_RESOURCE_ATTRIBUTES": "gen_ai.provider.name=llama_cpp",
+    "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1"
 
 Verify from the client:
 

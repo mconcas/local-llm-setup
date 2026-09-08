@@ -34,6 +34,13 @@ limits_config:
   retention_period: ${LOGS_RETENTION}
   allow_structured_metadata: true
   volume_enabled: true
+  otlp_config:
+    resource_attributes:
+      attributes_config:
+        - action: index_label
+          attributes:
+            - gen_ai.provider.name
+            - host.name
 
 analytics:
   reporting_enabled: false

@@ -310,4 +310,64 @@ logs = [
           opts={"showTime": True, "showLabels": True, "wrapLogMessage": True, "prettifyLogMessage": False, "sortOrder": "Descending", "dedupStrategy": "none", "enableLogDetails": True}),
 ]
 json.dump(dashboard("logs", "Logs", logs, templating=[cvar, svar], tags=["logs"], rng="now-1h"), open(f"{OUT}/logs.json", "w"), indent=2)
+# ── Claude Code (OTLP via Alloy) ─────────────────────────────────
+TEMPO = {"type": "tempo", "uid": "tempo"}
+pvar = var_query("provider", "Provider", 'label_values(claude_code_session_count_total, gen_ai_provider_name)', current="All")
+hvar = var_query("host", "Host", 'label_values(claude_code_session_count_total{gen_ai_provider_name=~"$provider"}, host_name)', current="All")
+CF = 'gen_ai_provider_name=~"$provider", host_name=~"$host"'
+CE = f'{{service_name="claude-code", {CF}}}'
+COST_NOTE = "Claude Code's own estimate at Anthropic list prices for the reported model name; a local model has no price, so its figure is not a cost"
+cc = [
+    row("Sessions", 0),
+    panel("stat", "Sessions (range)", [q(f'sum(last_over_time(claude_code_session_count_total{{{CF}}}[$__range]) - min_over_time(claude_code_session_count_total{{{CF}}}[$__range])) or vector(0)')], 0, 1, 4, 4, decimals=0, opts={"graphMode": "none"}),
+    panel("stat", "Active time (range)", [q(f'sum(last_over_time(claude_code_active_time_seconds_total{{{CF}}}[$__range]) - min_over_time(claude_code_active_time_seconds_total{{{CF}}}[$__range])) or vector(0)')], 4, 1, 4, 4, unit="s", decimals=0, opts={"graphMode": "none"}),
+    panel("stat", "Tokens (range)", [q(f'sum(last_over_time(claude_code_token_usage_tokens_total{{{CF}}}[$__range]) - min_over_time(claude_code_token_usage_tokens_total{{{CF}}}[$__range])) or vector(0)')], 8, 1, 4, 4, unit="short", decimals=1, opts={"graphMode": "none"}),
+    panel("stat", "Output tokens (range)", [q(f'sum(last_over_time(claude_code_token_usage_tokens_total{{{CF}, type="output"}}[$__range]) - min_over_time(claude_code_token_usage_tokens_total{{{CF}, type="output"}}[$__range])) or vector(0)')], 12, 1, 4, 4, unit="short", decimals=1, opts={"graphMode": "none"}),
+    panel("stat", "Estimated cost (range)", [q(f'sum(last_over_time(claude_code_cost_usage_USD_total{{{CF}, gen_ai_provider_name="anthropic"}}[$__range]) - min_over_time(claude_code_cost_usage_USD_total{{{CF}, gen_ai_provider_name="anthropic"}}[$__range])) or vector(0)')], 16, 1, 4, 4, unit="currencyUSD", decimals=2, opts={"graphMode": "none"}, desc="Anthropic sessions only. " + COST_NOTE),
+    panel("stat", "API errors (range)", [q(f'sum(count_over_time({CE} | event_name="api_error" [$__range])) or vector(0)', ds=LOKI)], 20, 1, 4, 4, ds=LOKI, decimals=0, thresholds=GYR(1, 5), opts={"graphMode": "none"}),
+    panel("timeseries", "Sessions started by provider and host", [q(f'sum by (gen_ai_provider_name, host_name) (increase(claude_code_session_count_total{{{CF}}}[$__auto]))', "{{gen_ai_provider_name}} {{host_name}}")], 0, 5, 12, 8, decimals=0),
+    panel("timeseries", "Active time by type", [q(f'sum by (type) (rate(claude_code_active_time_seconds_total{{{CF}}}[$__auto]))', "{{type}}")], 12, 5, 12, 8, unit="percentunit", desc="user: keyboard activity; cli: tool execution and model responses. Rate of active seconds per wall-clock second, summed over sessions"),
+
+    row("Tokens and cost", 13),
+    panel("timeseries", "Tokens per minute by type", [q(f'sum by (type) (rate(claude_code_token_usage_tokens_total{{{CF}}}[$__auto])) * 60', "{{type}}")], 0, 14, 8, 8, unit="short"),
+    panel("timeseries", "Tokens per minute by model", [q(f'sum by (model) (rate(claude_code_token_usage_tokens_total{{{CF}}}[$__auto])) * 60', "{{model}}")], 8, 14, 8, 8, unit="short"),
+    panel("timeseries", "Tokens per minute by provider", [q(f'sum by (gen_ai_provider_name) (rate(claude_code_token_usage_tokens_total{{{CF}}}[$__auto])) * 60', "{{gen_ai_provider_name}}")], 16, 14, 8, 8, unit="short"),
+    panel("timeseries", "Cache hit ratio", [q(f'sum(rate(claude_code_token_usage_tokens_total{{{CF}, type="cacheRead"}}[$__auto])) / (sum(rate(claude_code_token_usage_tokens_total{{{CF}, type=~"cacheRead|input|cacheCreation"}}[$__auto])))', "cache read share")], 0, 22, 8, 8, unit="percentunit", min_=0, max_=1, desc="Cache-read tokens over all prompt tokens (input + cache read + cache creation)"),
+    panel("timeseries", "Estimated cost per hour by model", [q(f'sum by (model) (rate(claude_code_cost_usage_USD_total{{{CF}, gen_ai_provider_name="anthropic"}}[$__auto])) * 3600', "{{model}}")], 8, 22, 8, 8, unit="currencyUSD", desc="Anthropic sessions only. " + COST_NOTE),
+    panel("timeseries", "Tokens per minute by query source", [q(f'sum by (query_source) (rate(claude_code_token_usage_tokens_total{{{CF}}}[$__auto])) * 60', "{{query_source}}")], 16, 22, 8, 8, unit="short", desc="main: the conversation; subagent: Agent tool workers; auxiliary: background jobs such as compaction"),
+
+    row("API requests (events)", 30),
+    panel("timeseries", "API requests per minute by model", [q(f'sum by (model) (count_over_time({CE} | event_name="api_request" [$__auto])) * 60 / $__auto_ms * 1000 / 60', "{{model}}", ds=LOKI)], 0, 31, 8, 8, ds=LOKI, unit="reqpm"),
+    panel("timeseries", "API request duration (p50 / p95)", [
+        q(f'quantile_over_time(0.50, {CE} | event_name="api_request" | unwrap duration_ms [$__auto]) by ()', "p50", ds=LOKI),
+        q(f'quantile_over_time(0.95, {CE} | event_name="api_request" | unwrap duration_ms [$__auto]) by ()', "p95", ds=LOKI, i=1),
+    ], 8, 31, 8, 8, ds=LOKI, unit="ms"),
+    panel("timeseries", "API errors per minute by status", [q(f'sum by (status_code) (count_over_time({CE} | event_name="api_error" [$__auto])) * 60 / $__auto_ms * 1000 / 60', "{{status_code}}", ds=LOKI)], 16, 31, 8, 8, ds=LOKI, unit="reqpm",
+          overrides=[{"matcher": {"id": "byRegexp", "options": "5.."}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}]),
+
+    row("Tools", 39),
+    panel("timeseries", "Tool calls per minute by tool", [q(f'sum by (tool_name) (count_over_time({CE} | event_name="tool_result" [$__auto])) * 60 / $__auto_ms * 1000 / 60', "{{tool_name}}", ds=LOKI)], 0, 40, 8, 8, ds=LOKI, unit="reqpm"),
+    panel("timeseries", "Tool duration p95 by tool", [q(f'quantile_over_time(0.95, {CE} | event_name="tool_result" | unwrap duration_ms [$__auto]) by (tool_name)', "{{tool_name}}", ds=LOKI)], 8, 40, 8, 8, ds=LOKI, unit="ms"),
+    panel("timeseries", "Permission decisions per minute", [q(f'sum by (decision, source) (count_over_time({CE} | event_name="tool_decision" [$__auto])) * 60 / $__auto_ms * 1000 / 60', "{{decision}} {{source}}", ds=LOKI)], 16, 40, 8, 8, ds=LOKI, unit="reqpm",
+          overrides=[{"matcher": {"id": "byRegexp", "options": "reject.*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}]),
+    panel("table", "Tool failures (range)", [q(f'topk(20, sum by (tool_name, error_type) (count_over_time({CE} | event_name="tool_result" | success="false" [$__range])))', ds=LOKI, instant=True, format="table")], 0, 48, 12, 8, ds=LOKI,
+          opts={"sortBy": [{"displayName": "Value", "desc": True}]}),
+    panel("table", "Lines of code and commits (range)", [
+        q(f'sum by (type) (last_over_time(claude_code_lines_of_code_count_total{{{CF}}}[$__range]) - min_over_time(claude_code_lines_of_code_count_total{{{CF}}}[$__range]))', "lines {{type}}", instant=True, format="table"),
+        q(f'sum(last_over_time(claude_code_commit_count_total{{{CF}}}[$__range]) - min_over_time(claude_code_commit_count_total{{{CF}}}[$__range]))', "commits", instant=True, format="table", i=1),
+        q(f'sum(last_over_time(claude_code_pull_request_count_total{{{CF}}}[$__range]) - min_over_time(claude_code_pull_request_count_total{{{CF}}}[$__range]))', "pull requests", instant=True, format="table", i=2),
+    ], 12, 48, 12, 8),
+
+    row("Prompts and traces", 56),
+    panel("logs", "Prompts", [q(f'{CE} | event_name="user_prompt" | line_format "{{{{.prompt}}}}"', ds=LOKI)], 0, 57, 12, 12, ds=LOKI,
+          opts={"showTime": True, "showLabels": False, "wrapLogMessage": True, "sortOrder": "Descending", "dedupStrategy": "none", "enableLogDetails": True},
+          desc="Prompt text is exported only when OTEL_LOG_USER_PROMPTS=1 on the client; otherwise the line reads <REDACTED>"),
+    {"id": next(_id), "type": "table", "title": "Recent interactions (Tempo)", "datasource": TEMPO, "gridPos": {"x": 12, "y": 57, "w": 12, "h": 12},
+     "targets": [{"refId": "A", "datasource": TEMPO, "queryType": "traceql", "query": '{ resource.service.name="claude-code" && name="claude_code.interaction" }', "limit": 20, "tableType": "traces"}],
+     "fieldConfig": {"defaults": {}, "overrides": []}, "options": {},
+     "description": "One trace per prompt; spans for API calls, tool calls, hooks and permission waits. Needs CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 on the client"},
+    panel("logs", "Events", [q(f'{CE} | line_format "{{{{.event_name}}}} {{{{if .tool_name}}}}{{{{.tool_name}}}} {{{{end}}}}{{{{if .model}}}}{{{{.model}}}} {{{{end}}}}{{{{if .duration_ms}}}}{{{{.duration_ms}}}}ms{{{{end}}}}"', ds=LOKI)], 0, 69, 24, 10, ds=LOKI,
+          opts={"showTime": True, "showLabels": False, "wrapLogMessage": False, "sortOrder": "Descending", "dedupStrategy": "none", "enableLogDetails": True}),
+]
+json.dump(dashboard("claude-code", "Claude Code", cc, templating=[pvar, hvar], tags=["claude-code"]), open(f"{OUT}/claude-code.json", "w"), indent=2)
 print("dashboards written to", OUT)
