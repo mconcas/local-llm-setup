@@ -28,6 +28,7 @@ services:
       # Extra variables for the chat template, e.g. {"enable_thinking":false}
       # to turn off thinking on Qwen models.
       LLAMA_ARG_CHAT_TEMPLATE_KWARGS: ${CHAT_TEMPLATE_KWARGS:-{}}
+      LLAMA_ARG_REASONING: ${REASONING:-auto}
       # Prometheus endpoint at /metrics (scraped by docker-compose.observability.yml).
       LLAMA_ARG_ENDPOINT_METRICS: "1"
     # Raw HTTP on localhost only; network access goes through nginx.

@@ -86,7 +86,8 @@ All settings live in `.env` (created from `.env.example` by the setup script):
 | `GPU_LAYERS`   | `-1`                 | Layers offloaded to GPU (`-1` = all)      |
 | `PARALLEL`     | `1`                  | Concurrent request slots                  |
 | `HTTPS_PORT`   | `8443`               | Port exposed for HTTPS                    |
-| `CHAT_TEMPLATE_KWARGS` | `{}`         | Extra chat-template variables, e.g. `{"enable_thinking":false}` |
+| `REASONING`    | `auto`               | Thinking: `auto` follows the template, `off` disables it, `on` forces it |
+| `CHAT_TEMPLATE_KWARGS` | `{}`         | Extra chat-template variables as a JSON object |
 | `CACHE_TYPE_K` | `q8_0`               | KV-cache key quantisation (`f16`, `q8_0`) |
 | `CACHE_TYPE_V` | `q8_0`               | KV-cache value quantisation               |
 | `LLAMA_IMAGE`  | `ghcr.io/ggml-org/llama.cpp:server-cuda-b10818` | llama.cpp server image, pinned per build; the Jetson override pins the matching `llama-server-jetson` build |
@@ -214,10 +215,10 @@ relaxations as the Qwen3.8 one. Measured on the Orin Nano with the full
 stack idle, CUDA can allocate about 5.2 GiB; this quant at `CTX_SIZE=65536`
 uses 2.9 GiB weights + 1.1 GiB KV + 0.2 GiB recurrent state + 0.4 GiB
 compute and leaves ~1 GiB. Q6_K (3.8 GiB loaded) does not fit at any context
-size worth having. Thinking is disabled through the template
-(`CHAT_TEMPLATE_KWARGS={"enable_thinking":false}`; `--reasoning-budget 0`
-has no effect on this model): background jobs are latency-bound and the
-model otherwise spends its whole output budget reasoning.
+size worth having. Thinking is disabled with
+`REASONING=off` (`--reasoning-budget 0` has no effect on this model):
+background jobs are latency-bound and the model otherwise spends its whole
+output budget reasoning.
 
 ```bash
 # On the Jetson, after the Jetson section above:
@@ -229,7 +230,7 @@ model otherwise spends its whole output budget reasoning.
 MODEL_FILE=/models/Qwen3.5-4B-UD-Q4_K_XL.gguf
 CHAT_TEMPLATE_FILE=/templates/qwen3.5-4b-relaxed.jinja
 CTX_SIZE=65536
-CHAT_TEMPLATE_KWARGS={"enable_thinking":false}
+REASONING=off
 ```
 
 `docker compose up -d` (nginx needs `--force-recreate` when only the routing
