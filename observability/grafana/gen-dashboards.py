@@ -46,7 +46,7 @@ def var_query(name, label, query, ds=PROM, multi=True, all_=True, current=None):
     v = {"name": name, "label": label, "type": "query", "datasource": ds, "query": query, "refresh": 2,
          "multi": multi, "includeAll": all_, "sort": 1}
     if current is not None:
-        v["current"] = {"text": current, "value": current}
+        v["current"] = {"text": current, "value": "$__all" if current == "All" else current}
     return v
 
 BIN = {"mode": "absolute", "steps": [{"color": "red", "value": None}, {"color": "green", "value": 1}]}
@@ -143,13 +143,12 @@ nginx = [
     panel("timeseries", "llama.cpp timings (p95)", [
         q(f'quantile_over_time(0.95, {NXR} | usage_prompt_ms=~"[0-9]+" | unwrap usage_prompt_ms [$__auto]) by (route)', "prompt {{route}}", ds=LOKI),
         q(f'quantile_over_time(0.95, {NXR} | usage_predicted_ms=~"[0-9]+" | unwrap usage_predicted_ms [$__auto]) by (route)', "generation {{route}}", ds=LOKI, i=1),
-    ], 16, 29, 8, 8, ds=LOKI, unit="ms", desc="Backend-reported prompt-processing and generation time per request; only legs served by llama.cpp report it"),
+    ], 16, 29, 8, 8, ds=LOKI, unit="ms", desc="Backend-reported prompt-processing and generation time per request. Only OpenAI-format responses carry timings; Anthropic-format responses (Claude Code) do not"),
     panel("timeseries", "Tokens per minute by route", [
         q(f'sum by (route) (sum_over_time({NXU} | unwrap usage_input [$__auto])) * 60', "input {{route}}", ds=LOKI),
         q(f'sum by (route) (sum_over_time({NXU} | unwrap usage_output [$__auto])) * 60', "output {{route}}", ds=LOKI, i=1),
         q(f'sum by (route) (sum_over_time({NXU} | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) * 60', "cache read {{route}}", ds=LOKI, i=2),
-        q(f'sum by (route) (sum_over_time({NXU} | usage_cache_creation=~"[0-9]+" | unwrap usage_cache_creation [$__auto])) * 60', "cache creation {{route}}", ds=LOKI, i=3),
-    ], 0, 37, 12, 8, ds=LOKI, unit="short", desc="As reported by each backend in the response usage block; Anthropic input_tokens exclude cached tokens, OpenAI-format prompt_tokens include them"),
+    ], 0, 37, 12, 8, ds=LOKI, unit="short", desc="As reported by each backend in the response usage block; Anthropic input_tokens exclude cached tokens, OpenAI-format prompt_tokens include them. llama.cpp reports no cache_creation_input_tokens"),
     panel("timeseries", "Cache read share by route", [
         q(f'sum by (route) (sum_over_time({NXU} | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])) / (sum by (route) (sum_over_time({NXU} | unwrap usage_input [$__auto])) + sum by (route) (sum_over_time({NXU} | usage_cache_read=~"[0-9]+" | unwrap usage_cache_read [$__auto])))', "{{route}}", ds=LOKI),
     ], 12, 37, 12, 8, ds=LOKI, unit="percentunit", min_=0, max_=1, desc="llama.cpp reports cache_read_input_tokens in Anthropic-format responses"),
@@ -322,9 +321,11 @@ cc = [
     panel("stat", "Sessions (range)", [q(f'sum(last_over_time(claude_code_session_count_total{{{CF}}}[$__range]) - min_over_time(claude_code_session_count_total{{{CF}}}[$__range])) or vector(0)')], 0, 1, 4, 4, decimals=0, opts={"graphMode": "none"}),
     panel("stat", "Active time (range)", [q(f'sum(last_over_time(claude_code_active_time_seconds_total{{{CF}}}[$__range]) - min_over_time(claude_code_active_time_seconds_total{{{CF}}}[$__range])) or vector(0)')], 4, 1, 4, 4, unit="s", decimals=0, opts={"graphMode": "none"}),
     panel("stat", "Tokens (range)", [q(f'sum(last_over_time(claude_code_token_usage_tokens_total{{{CF}}}[$__range]) - min_over_time(claude_code_token_usage_tokens_total{{{CF}}}[$__range])) or vector(0)')], 8, 1, 4, 4, unit="short", decimals=1, opts={"graphMode": "none"}),
-    panel("stat", "Output tokens (range)", [q(f'sum(last_over_time(claude_code_token_usage_tokens_total{{{CF}, type="output"}}[$__range]) - min_over_time(claude_code_token_usage_tokens_total{{{CF}, type="output"}}[$__range])) or vector(0)')], 12, 1, 4, 4, unit="short", decimals=1, opts={"graphMode": "none"}),
-    panel("stat", "Estimated cost (range)", [q(f'sum(last_over_time(claude_code_cost_usage_USD_total{{{CF}, gen_ai_provider_name="anthropic"}}[$__range]) - min_over_time(claude_code_cost_usage_USD_total{{{CF}, gen_ai_provider_name="anthropic"}}[$__range])) or vector(0)')], 16, 1, 4, 4, unit="currencyUSD", decimals=2, opts={"graphMode": "none"}, desc="Anthropic sessions only. " + COST_NOTE),
-    panel("stat", "API errors (range)", [q(f'sum(count_over_time({CE} | event_name="api_error" [$__range])) or vector(0)', ds=LOKI)], 20, 1, 4, 4, ds=LOKI, decimals=0, thresholds=GYR(1, 5), opts={"graphMode": "none"}),
+    panel("stat", "Output tokens (range)", [q(f'sum(last_over_time(claude_code_token_usage_tokens_total{{{CF}, type="output"}}[$__range]) - min_over_time(claude_code_token_usage_tokens_total{{{CF}, type="output"}}[$__range])) or vector(0)')], 12, 1, 3, 4, unit="short", decimals=1, opts={"graphMode": "none"}),
+    panel("stat", "Estimated cost (range)", [q(f'sum(last_over_time(claude_code_cost_usage_USD_total{{{CF}, gen_ai_provider_name="anthropic"}}[$__range]) - min_over_time(claude_code_cost_usage_USD_total{{{CF}, gen_ai_provider_name="anthropic"}}[$__range])) or vector(0)')], 15, 1, 3, 4, unit="currencyUSD", decimals=2, opts={"graphMode": "none"}, desc="Anthropic sessions only. " + COST_NOTE),
+    panel("stat", "API errors (range)", [q(f'sum(count_over_time({CE} | event_name="api_error" [$__range])) or vector(0)', ds=LOKI)], 18, 1, 3, 4, ds=LOKI, decimals=0, thresholds=GYR(1, 5), opts={"graphMode": "none"}),
+    panel("stat", "Rejected exports (range)", [q('sum(count_over_time({container="llama-proxy"} |= "\\"status\\":" | json | uri=~"/otlp/.*" | status = 400 [$__range])) or vector(0)', ds=LOKI)], 21, 1, 3, 4, ds=LOKI, decimals=0, thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}], opts={"graphMode": "none"},
+          desc="OTLP exports nginx refused because the client sent no certificate. Such a session exports nothing: its launcher lacks NODE_EXTRA_CA_CERTS, CLAUDE_CODE_CLIENT_CERT and CLAUDE_CODE_CLIENT_KEY (README, Claude Code telemetry)"),
     panel("timeseries", "Sessions started by provider and host", [q(f'sum by (gen_ai_provider_name, host_name) (increase(claude_code_session_count_total{{{CF}}}[$__auto]))', "{{gen_ai_provider_name}} {{host_name}}")], 0, 5, 12, 8, decimals=0),
     panel("timeseries", "Active time by type", [q(f'sum by (type) (rate(claude_code_active_time_seconds_total{{{CF}}}[$__auto]))', "{{type}}")], 12, 5, 12, 8, unit="percentunit", desc="user: keyboard activity; cli: tool execution and model responses. Rate of active seconds per wall-clock second, summed over sessions"),
 

@@ -31,7 +31,7 @@
         "sort": 1,
         "current": {
           "text": "All",
-          "value": "All"
+          "value": "$__all"
         }
       },
       {
@@ -49,7 +49,7 @@
         "sort": 1,
         "current": {
           "text": "All",
-          "value": "All"
+          "value": "$__all"
         }
       }
     ]
@@ -222,7 +222,7 @@
       "gridPos": {
         "x": 12,
         "y": 1,
-        "w": 4,
+        "w": 3,
         "h": 4
       },
       "targets": [
@@ -268,9 +268,9 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 16,
+        "x": 15,
         "y": 1,
-        "w": 4,
+        "w": 3,
         "h": 4
       },
       "targets": [
@@ -317,9 +317,9 @@
         "uid": "loki"
       },
       "gridPos": {
-        "x": 20,
+        "x": 18,
         "y": 1,
-        "w": 4,
+        "w": 3,
         "h": 4
       },
       "targets": [
@@ -374,6 +374,67 @@
     },
     {
       "id": 89,
+      "type": "stat",
+      "title": "Rejected exports (range)",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 21,
+        "y": 1,
+        "w": 3,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | uri=~\"/otlp/.*\" | status = 400 [$__range])) or vector(0)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "description": "OTLP exports nginx refused because the client sent no certificate. Such a session exports nothing: its launcher lacks NODE_EXTRA_CA_CERTS, CLAUDE_CODE_CLIENT_CERT and CLAUDE_CODE_CLIENT_KEY (README, Claude Code telemetry)"
+    },
+    {
+      "id": 90,
       "type": "timeseries",
       "title": "Sessions started by provider and host",
       "datasource": {
@@ -424,7 +485,7 @@
       }
     },
     {
-      "id": 90,
+      "id": 91,
       "type": "timeseries",
       "title": "Active time by type",
       "datasource": {
@@ -476,7 +537,7 @@
       "description": "user: keyboard activity; cli: tool execution and model responses. Rate of active seconds per wall-clock second, summed over sessions"
     },
     {
-      "id": 91,
+      "id": 92,
       "type": "row",
       "title": "Tokens and cost",
       "collapsed": false,
@@ -489,7 +550,7 @@
       "panels": []
     },
     {
-      "id": 92,
+      "id": 93,
       "type": "timeseries",
       "title": "Tokens per minute by type",
       "datasource": {
@@ -540,7 +601,7 @@
       }
     },
     {
-      "id": 93,
+      "id": 94,
       "type": "timeseries",
       "title": "Tokens per minute by model",
       "datasource": {
@@ -591,7 +652,7 @@
       }
     },
     {
-      "id": 94,
+      "id": 95,
       "type": "timeseries",
       "title": "Tokens per minute by provider",
       "datasource": {
@@ -642,7 +703,7 @@
       }
     },
     {
-      "id": 95,
+      "id": 96,
       "type": "timeseries",
       "title": "Cache hit ratio",
       "datasource": {
@@ -696,7 +757,7 @@
       "description": "Cache-read tokens over all prompt tokens (input + cache read + cache creation)"
     },
     {
-      "id": 96,
+      "id": 97,
       "type": "timeseries",
       "title": "Estimated cost per hour by model",
       "datasource": {
@@ -748,7 +809,7 @@
       "description": "Anthropic sessions only. Claude Code's own estimate at Anthropic list prices for the reported model name; a local model has no price, so its figure is not a cost"
     },
     {
-      "id": 97,
+      "id": 98,
       "type": "timeseries",
       "title": "Tokens per minute by query source",
       "datasource": {
@@ -800,7 +861,7 @@
       "description": "main: the conversation; subagent: Agent tool workers; auxiliary: background jobs such as compaction"
     },
     {
-      "id": 98,
+      "id": 99,
       "type": "row",
       "title": "API requests (events)",
       "collapsed": false,
@@ -813,7 +874,7 @@
       "panels": []
     },
     {
-      "id": 99,
+      "id": 100,
       "type": "timeseries",
       "title": "API requests per minute by model",
       "datasource": {
@@ -864,7 +925,7 @@
       }
     },
     {
-      "id": 100,
+      "id": 101,
       "type": "timeseries",
       "title": "API request duration (p50 / p95)",
       "datasource": {
@@ -924,7 +985,7 @@
       }
     },
     {
-      "id": 101,
+      "id": 102,
       "type": "timeseries",
       "title": "API errors per minute by status",
       "datasource": {
@@ -991,7 +1052,7 @@
       }
     },
     {
-      "id": 102,
+      "id": 103,
       "type": "row",
       "title": "Tools",
       "collapsed": false,
@@ -1004,7 +1065,7 @@
       "panels": []
     },
     {
-      "id": 103,
+      "id": 104,
       "type": "timeseries",
       "title": "Tool calls per minute by tool",
       "datasource": {
@@ -1055,7 +1116,7 @@
       }
     },
     {
-      "id": 104,
+      "id": 105,
       "type": "timeseries",
       "title": "Tool duration p95 by tool",
       "datasource": {
@@ -1106,7 +1167,7 @@
       }
     },
     {
-      "id": 105,
+      "id": 106,
       "type": "timeseries",
       "title": "Permission decisions per minute",
       "datasource": {
@@ -1173,7 +1234,7 @@
       }
     },
     {
-      "id": 106,
+      "id": 107,
       "type": "table",
       "title": "Tool failures (range)",
       "datasource": {
@@ -1217,7 +1278,7 @@
       }
     },
     {
-      "id": 107,
+      "id": 108,
       "type": "table",
       "title": "Lines of code and commits (range)",
       "datasource": {
@@ -1276,7 +1337,7 @@
       "options": {}
     },
     {
-      "id": 108,
+      "id": 109,
       "type": "row",
       "title": "Prompts and traces",
       "collapsed": false,
@@ -1289,7 +1350,7 @@
       "panels": []
     },
     {
-      "id": 109,
+      "id": 110,
       "type": "logs",
       "title": "Prompts",
       "datasource": {
@@ -1332,7 +1393,7 @@
       "description": "Prompt text is exported only when OTEL_LOG_USER_PROMPTS=1 on the client; otherwise the line reads <REDACTED>"
     },
     {
-      "id": 110,
+      "id": 111,
       "type": "table",
       "title": "Recent interactions (Tempo)",
       "datasource": {
@@ -1366,7 +1427,7 @@
       "description": "One trace per prompt; spans for API calls, tool calls, hooks and permission waits. Needs CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 on the client"
     },
     {
-      "id": 111,
+      "id": 112,
       "type": "logs",
       "title": "Events",
       "datasource": {

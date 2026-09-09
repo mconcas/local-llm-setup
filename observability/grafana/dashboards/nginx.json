@@ -1074,7 +1074,7 @@
           "sort": "desc"
         }
       },
-      "description": "Backend-reported prompt-processing and generation time per request; only legs served by llama.cpp report it"
+      "description": "Backend-reported prompt-processing and generation time per request. Only OpenAI-format responses carry timings; Anthropic-format responses (Claude Code) do not"
     },
     {
       "id": 32,
@@ -1117,15 +1117,6 @@
             "uid": "loki"
           },
           "legendFormat": "cache read {{route}}"
-        },
-        {
-          "refId": "D",
-          "expr": "sum by (route) (sum_over_time({container=\"llama-proxy\"} |= \"\\\"status\\\":\" | json | client_cn=~\"$client_cn\" | uri=~\"$uri\" | route=~\"$route\" | route!=\"\" | usage_input=~\"[0-9]+\" | usage_output=~\"[0-9]+\" | usage_cache_creation=~\"[0-9]+\" | unwrap usage_cache_creation [$__auto])) * 60",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "legendFormat": "cache creation {{route}}"
         }
       ],
       "fieldConfig": {
@@ -1153,7 +1144,7 @@
           "sort": "desc"
         }
       },
-      "description": "As reported by each backend in the response usage block; Anthropic input_tokens exclude cached tokens, OpenAI-format prompt_tokens include them"
+      "description": "As reported by each backend in the response usage block; Anthropic input_tokens exclude cached tokens, OpenAI-format prompt_tokens include them. llama.cpp reports no cache_creation_input_tokens"
     },
     {
       "id": 33,

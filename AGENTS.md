@@ -93,6 +93,17 @@ its upstream at request time so nginx starts without the add-on (502 instead of 
 startup failure). Validate panels by posting every target to
 `/grafana/api/ds/query` and checking for errors or empty frames.
 
+## Claude Code telemetry needs the client certificate in every launcher mode
+
+Sessions export OTLP to `/otlp/` on the mTLS vhost, so a session started without
+`NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT` and `CLAUDE_CODE_CLIENT_KEY` in its
+environment (a launcher pointed at `api.anthropic.com`, for instance) exports nothing:
+nginx answers 400 before the location, so the rejections do show up in the access log
+(`{container="llama-proxy"} | json | uri=~"/otlp/.*" | status=400`, empty `client_cn`)
+and in the Claude Code dashboard's "Rejected exports" stat. Keep the three variables in
+`~/.claude/settings.json` `env` on every client. Reproduce with `claude -p` pointed at a
+throwaway `nginx:alpine` on the compose network whose `/otlp/` location is access-logged.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
