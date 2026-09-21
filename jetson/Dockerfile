@@ -10,7 +10,7 @@ ARG L4T_CUDA_RUNTIME_TAG=12.6.11-runtime
 
 FROM nvcr.io/nvidia/l4t-jetpack:${L4T_JETPACK_TAG} AS build
 
-ARG LLAMA_CPP_REF=b10818
+ARG LLAMA_CPP_REF=b10964
 # The Orin Nano has 6 cores but only ~7 GiB of shared RAM; nvcc jobs are
 # memory-hungry, so default below $(nproc).
 ARG BUILD_JOBS=4
