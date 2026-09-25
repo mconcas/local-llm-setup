@@ -292,6 +292,7 @@ It copies `ca.crt`, `laptop.crt` and `laptop.key` to the client's
   "ANTHROPIC_BASE_URL": "https://myjetson.lan:8443",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.5-4b",
   "ENABLE_TOOL_SEARCH": "true",
+  "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
   "CLAUDE_CODE_CLIENT_CERT": "/home/me/.config/local-llm/laptop.crt",
   "CLAUDE_CODE_CLIENT_KEY": "/home/me/.config/local-llm/laptop.key",
   "NODE_EXTRA_CA_CERTS": "/home/me/.config/local-llm/ca.crt"
@@ -310,7 +311,16 @@ no hosted credential belongs in this configuration. Verify with
 MCP tool schema upfront, and llama.cpp b10499 turns some of them (e.g. a
 `format: date` string) into a grammar it then fails to parse, answering
 `400 Failed to initialize samplers`. With tool search on, MCP tools arrive as
-`tool_reference` blocks, which this proxy forwards untouched. Other
+`tool_reference` blocks, which this proxy forwards untouched.
+
+`CLAUDE_CODE_AUTO_MODE_SERVER=0` keeps auto mode's classifier requests
+client-side. Claude Code 2.1.278 and later otherwise asks the server to review
+actions inside the main request (a `safeguards` body field answered by
+`safeguard_results`); llama.cpp ignores the field, so every session falls
+back to its own classifier requests and first shows a notice that holds the
+action until Enter. With the variable set the fallback is the only path and
+the notice never appears; the classifier requests arrive here with
+`model: claude-sonnet-5` and are served by the local model. Other
 consequences of a non-first-party base URL (Claude Code docs): Remote
 Control is disabled, fast-mode and WebFetch safety checks still call
 `api.anthropic.com` directly, `--model haiku` warns that the model ID is

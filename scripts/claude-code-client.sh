@@ -50,6 +50,7 @@ Add to ~/.claude/settings.json on the client (absolute paths, no ~ and no
     "ANTHROPIC_AUTH_TOKEN": "not-needed",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$HAIKU_MODEL",
     "ENABLE_TOOL_SEARCH": "true",
+    "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
     "CLAUDE_CODE_CLIENT_CERT": "/home/USER/.config/local-llm/$NAME.crt",
     "CLAUDE_CODE_CLIENT_KEY": "/home/USER/.config/local-llm/$NAME.key",
     "NODE_EXTRA_CA_CERTS": "/home/USER/.config/local-llm/ca.crt"
